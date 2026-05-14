@@ -1,10 +1,13 @@
 import type {
+  BinaryExpression,
+  BindingPattern,
   CallExpression,
   Expression,
   FunctionDeclaration,
   MemberExpression,
   Program,
   Statement,
+  UnaryExpression,
 } from "./ast.ts";
 import { ImportError, RuntimeError } from "./errors.ts";
 import { parseHarlan } from "./parser.ts";
@@ -82,9 +85,8 @@ async function evaluateStatement(
 ): Promise<HarlanValue> {
   switch (statement.kind) {
     case "LetDeclaration": {
-      assertCanBind(scope, statement.name, statement.span, context.source);
       const value = await evaluateExpression(statement.value, scope, context);
-      scope.set(statement.name, value);
+      bindPattern(statement.pattern, value, scope, context);
       return value;
     }
     case "FunctionDeclaration": {
@@ -172,6 +174,28 @@ async function evaluateExpression(
       return { kind: "number", value: expression.value };
     case "BooleanLiteral":
       return { kind: "boolean", value: expression.value };
+    case "NullLiteral":
+      return { kind: "null" };
+    case "IfExpression": {
+      const condition = await evaluateExpression(expression.condition, scope, context);
+      if (condition.kind !== "boolean") {
+        throw new RuntimeError(
+          "if condition must be a boolean",
+          expression.condition.span,
+          context.source,
+        );
+      }
+
+      return evaluateExpression(
+        condition.value ? expression.thenBranch : expression.elseBranch,
+        scope,
+        context,
+      );
+    }
+    case "BinaryExpression":
+      return evaluateBinary(expression, scope, context);
+    case "UnaryExpression":
+      return evaluateUnary(expression, scope, context);
     case "IdentifierExpression": {
       const value = scope.get(expression.name);
       if (!value) {
@@ -210,6 +234,88 @@ async function evaluateExpression(
       return evaluateCall(expression, scope, context);
     case "PipelineExpression":
       return evaluatePipeline(expression.left, expression.right, scope, context);
+  }
+}
+
+async function evaluateUnary(
+  expression: UnaryExpression,
+  scope: Scope,
+  context: RuntimeContext,
+): Promise<HarlanValue> {
+  const argument = await evaluateExpression(expression.argument, scope, context);
+  if (argument.kind !== "boolean") {
+    throw new RuntimeError("not operand must be a boolean", expression.span, context.source);
+  }
+
+  return { kind: "boolean", value: !argument.value };
+}
+
+async function evaluateBinary(
+  expression: BinaryExpression,
+  scope: Scope,
+  context: RuntimeContext,
+): Promise<HarlanValue> {
+  if (expression.operator === "and") {
+    const left = await evaluateExpression(expression.left, scope, context);
+    if (left.kind !== "boolean") {
+      throw new RuntimeError(
+        "and left operand must be a boolean",
+        expression.left.span,
+        context.source,
+      );
+    }
+    if (!left.value) {
+      return { kind: "boolean", value: false };
+    }
+
+    const right = await evaluateExpression(expression.right, scope, context);
+    if (right.kind !== "boolean") {
+      throw new RuntimeError(
+        "and right operand must be a boolean",
+        expression.right.span,
+        context.source,
+      );
+    }
+    return { kind: "boolean", value: right.value };
+  }
+
+  if (expression.operator === "or") {
+    const left = await evaluateExpression(expression.left, scope, context);
+    if (left.kind !== "boolean") {
+      throw new RuntimeError(
+        "or left operand must be a boolean",
+        expression.left.span,
+        context.source,
+      );
+    }
+    if (left.value) {
+      return { kind: "boolean", value: true };
+    }
+
+    const right = await evaluateExpression(expression.right, scope, context);
+    if (right.kind !== "boolean") {
+      throw new RuntimeError(
+        "or right operand must be a boolean",
+        expression.right.span,
+        context.source,
+      );
+    }
+    return { kind: "boolean", value: right.value };
+  }
+
+  const left = await evaluateExpression(expression.left, scope, context);
+  const right = await evaluateExpression(expression.right, scope, context);
+
+  switch (expression.operator) {
+    case "==":
+      return { kind: "boolean", value: valuesEqual(left, right) };
+    case "!=":
+      return { kind: "boolean", value: !valuesEqual(left, right) };
+    case "<":
+    case "<=":
+    case ">":
+    case ">=":
+      return compareValues(expression.operator, left, right, context, expression.span);
   }
 }
 
@@ -296,5 +402,154 @@ async function evaluatePipeline(
 function assertCanBind(scope: Scope, name: string, span: SourceSpan, source: string): void {
   if (scope.has(name)) {
     throw new RuntimeError(`binding \`${name}\` already exists`, span, source);
+  }
+}
+
+function bindPattern(
+  pattern: BindingPattern,
+  value: HarlanValue,
+  scope: Scope,
+  context: RuntimeContext,
+): void {
+  const names = collectPatternNames(pattern);
+  const seen = new Set<string>();
+
+  for (const { name, span } of names) {
+    if (seen.has(name)) {
+      throw new RuntimeError(`duplicate binding \`${name}\` in pattern`, span, context.source);
+    }
+    seen.add(name);
+    assertCanBind(scope, name, span, context.source);
+  }
+
+  const bindings = resolvePatternBindings(pattern, value, context);
+  for (const [name, boundValue] of bindings) {
+    scope.set(name, boundValue);
+  }
+}
+
+function collectPatternNames(pattern: BindingPattern): Array<{ name: string; span: SourceSpan }> {
+  switch (pattern.kind) {
+    case "IdentifierPattern":
+      return [{ name: pattern.name, span: pattern.span }];
+    case "RecordPattern":
+      return pattern.fields.flatMap((field) => collectPatternNames(field.pattern));
+    case "ListPattern":
+      return pattern.items.flatMap(collectPatternNames);
+  }
+}
+
+function resolvePatternBindings(
+  pattern: BindingPattern,
+  value: HarlanValue,
+  context: RuntimeContext,
+): Array<[string, HarlanValue]> {
+  switch (pattern.kind) {
+    case "IdentifierPattern":
+      return [[pattern.name, value]];
+    case "RecordPattern":
+      if (value.kind !== "record") {
+        throw new RuntimeError(
+          "record destructuring requires a record value",
+          pattern.span,
+          context.source,
+        );
+      }
+      return pattern.fields.flatMap((field) =>
+        resolvePatternBindings(
+          field.pattern,
+          value.fields.get(field.name) ?? { kind: "null" },
+          context,
+        ),
+      );
+    case "ListPattern":
+      if (value.kind !== "list") {
+        throw new RuntimeError(
+          "list destructuring requires a list value",
+          pattern.span,
+          context.source,
+        );
+      }
+      return pattern.items.flatMap((item, index) =>
+        resolvePatternBindings(item, value.items[index] ?? { kind: "null" }, context),
+      );
+  }
+}
+
+function valuesEqual(left: HarlanValue, right: HarlanValue): boolean {
+  if (left.kind !== right.kind) {
+    return false;
+  }
+
+  switch (left.kind) {
+    case "null":
+      return true;
+    case "string":
+    case "number":
+    case "boolean":
+      return left.value === (right as { value: string | number | boolean }).value;
+    case "function":
+      return left === right;
+    case "list": {
+      const rightList = right as typeof left;
+      return (
+        left.items.length === rightList.items.length &&
+        left.items.every((item, index) => valuesEqual(item, rightList.items[index]!))
+      );
+    }
+    case "record": {
+      const rightRecord = right as typeof left;
+      if (left.fields.size !== rightRecord.fields.size) {
+        return false;
+      }
+
+      for (const [key, leftValue] of left.fields) {
+        const rightValue = rightRecord.fields.get(key);
+        if (!rightValue || !valuesEqual(leftValue, rightValue)) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+  }
+}
+
+function compareValues(
+  operator: "<" | "<=" | ">" | ">=",
+  left: HarlanValue,
+  right: HarlanValue,
+  context: RuntimeContext,
+  span: SourceSpan,
+): HarlanValue {
+  if (left.kind === "number" && right.kind === "number") {
+    return { kind: "boolean", value: applyComparison(operator, left.value, right.value) };
+  }
+
+  if (left.kind === "string" && right.kind === "string") {
+    return { kind: "boolean", value: applyComparison(operator, left.value, right.value) };
+  }
+
+  throw new RuntimeError(
+    "comparison operators require both operands to be numbers or both operands to be strings",
+    span,
+    context.source,
+  );
+}
+
+function applyComparison(
+  operator: "<" | "<=" | ">" | ">=",
+  left: number | string,
+  right: number | string,
+): boolean {
+  switch (operator) {
+    case "<":
+      return left < right;
+    case "<=":
+      return left <= right;
+    case ">":
+      return left > right;
+    case ">=":
+      return left >= right;
   }
 }

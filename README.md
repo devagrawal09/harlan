@@ -99,6 +99,51 @@ let files = ["README.md", "package.json"]
 task.path
 ```
 
+## Script Logic
+
+Use `if` expressions to branch on tool results:
+
+```harlan
+let fs = import("fs")
+
+if fs.exists("README.md") then
+  fs.read("README.md")
+else
+  "README.md is missing"
+```
+
+Comparisons and boolean operators work with explicit booleans:
+
+```harlan
+let fs = import("fs")
+let info = fs.info("README.md")
+
+info.kind == "file" and info.size > 0
+```
+
+Destructuring binds structured records and lists returned by helpers:
+
+```harlan
+let fs = import("fs")
+let format = import("format")
+
+let { matches, truncated } = fs.search("src", "runHarlan")
+
+if truncated then
+  "too many results"
+else
+  format.table(matches)
+```
+
+Syntax summary:
+
+- `if condition then a else b`
+- `==`, `!=`, `<`, `<=`, `>`, `>=`
+- `and`, `or`, `not`
+- `null`
+- `let { field } = record`
+- `let [first] = list`
+
 ## Built-in Modules
 
 `fs` provides local filesystem access inside the runtime working directory:

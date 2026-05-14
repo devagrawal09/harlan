@@ -17,6 +17,13 @@ export type TokenType =
   | "number"
   | "let"
   | "fn"
+  | "if"
+  | "then"
+  | "else"
+  | "and"
+  | "or"
+  | "not"
+  | "null"
   | "true"
   | "false"
   | "lParen"
@@ -29,6 +36,12 @@ export type TokenType =
   | "colon"
   | "dot"
   | "equals"
+  | "equalEqual"
+  | "bangEqual"
+  | "less"
+  | "lessEqual"
+  | "greater"
+  | "greaterEqual"
   | "arrow"
   | "pipe"
   | "eof";
@@ -43,6 +56,13 @@ export type Token = {
 const keywords = new Map<string, TokenType>([
   ["let", "let"],
   ["fn", "fn"],
+  ["if", "if"],
+  ["then", "then"],
+  ["else", "else"],
+  ["and", "and"],
+  ["or", "or"],
+  ["not", "not"],
+  ["null", "null"],
   ["true", "true"],
   ["false", "false"],
 ]);
@@ -141,7 +161,31 @@ class Lexer {
         this.add("dot", consumed, start);
         return;
       case "=":
+        if (this.match("=")) {
+          this.add("equalEqual", "==", start);
+          return;
+        }
         this.add("equals", consumed, start);
+        return;
+      case "!":
+        if (this.match("=")) {
+          this.add("bangEqual", "!=", start);
+          return;
+        }
+        break;
+      case "<":
+        if (this.match("=")) {
+          this.add("lessEqual", "<=", start);
+          return;
+        }
+        this.add("less", consumed, start);
+        return;
+      case ">":
+        if (this.match("=")) {
+          this.add("greaterEqual", ">=", start);
+          return;
+        }
+        this.add("greater", consumed, start);
         return;
       case "-":
         if (this.match(">")) {

@@ -1,4 +1,6 @@
 import type {
+  BinaryOperator,
+  BindingPattern,
   CallExpression,
   Expression,
   FunctionDeclaration,
@@ -6,6 +8,7 @@ import type {
   LetDeclaration,
   Program,
   RecordField,
+  RecordPatternField,
   Statement,
   TypeAnnotation,
 } from "./ast.ts";
@@ -55,13 +58,13 @@ class Parser {
   }
 
   private letDeclaration(start: SourceSpan): LetDeclaration {
-    const name = this.consumeIdentifier("expected binding name after `let`");
-    this.consume("equals", "expected `=` after let binding name");
+    const pattern = this.bindingPattern();
+    this.consume("equals", "expected `=` after let binding pattern");
     const value = this.expression();
 
     return {
       kind: "LetDeclaration",
-      name,
+      pattern,
       value,
       span: mergeSpans(start, value.span),
     };
@@ -127,14 +130,35 @@ class Parser {
   }
 
   private expression(): Expression {
-    return this.pipeline();
+    return this.ifExpression();
+  }
+
+  private ifExpression(): Expression {
+    if (!this.match("if")) {
+      return this.pipeline();
+    }
+
+    const start = this.previous().span;
+    const condition = this.expression();
+    this.consume("then", "expected `then` after if condition");
+    const thenBranch = this.expression();
+    this.consume("else", "expected `else` after then branch");
+    const elseBranch = this.expression();
+
+    return {
+      kind: "IfExpression",
+      condition,
+      thenBranch,
+      elseBranch,
+      span: mergeSpans(start, elseBranch.span),
+    };
   }
 
   private pipeline(): Expression {
-    let expression = this.call();
+    let expression = this.or();
 
     while (this.match("pipe")) {
-      const right = this.call();
+      const right = this.or();
       expression = {
         kind: "PipelineExpression",
         left: expression,
@@ -144,6 +168,86 @@ class Parser {
     }
 
     return expression;
+  }
+
+  private or(): Expression {
+    let expression = this.and();
+
+    while (this.match("or")) {
+      expression = this.binaryExpression(expression, "or", this.and());
+    }
+
+    return expression;
+  }
+
+  private and(): Expression {
+    let expression = this.equality();
+
+    while (this.match("and")) {
+      expression = this.binaryExpression(expression, "and", this.equality());
+    }
+
+    return expression;
+  }
+
+  private equality(): Expression {
+    let expression = this.comparison();
+
+    while (this.match("equalEqual", "bangEqual")) {
+      const operator = this.previous().type === "equalEqual" ? "==" : "!=";
+      expression = this.binaryExpression(expression, operator, this.comparison());
+    }
+
+    return expression;
+  }
+
+  private comparison(): Expression {
+    let expression = this.unary();
+
+    while (this.match("less", "lessEqual", "greater", "greaterEqual")) {
+      const operatorByToken: Record<string, BinaryOperator> = {
+        less: "<",
+        lessEqual: "<=",
+        greater: ">",
+        greaterEqual: ">=",
+      };
+      expression = this.binaryExpression(
+        expression,
+        operatorByToken[this.previous().type]!,
+        this.unary(),
+      );
+    }
+
+    return expression;
+  }
+
+  private unary(): Expression {
+    if (this.match("not")) {
+      const operator = this.previous();
+      const argument = this.unary();
+      return {
+        kind: "UnaryExpression",
+        operator: "not",
+        argument,
+        span: mergeSpans(operator.span, argument.span),
+      };
+    }
+
+    return this.call();
+  }
+
+  private binaryExpression(
+    left: Expression,
+    operator: BinaryOperator,
+    right: Expression,
+  ): Expression {
+    return {
+      kind: "BinaryExpression",
+      operator,
+      left,
+      right,
+      span: mergeSpans(left.span, right.span),
+    };
   }
 
   private call(): Expression {
@@ -214,6 +318,13 @@ class Parser {
       };
     }
 
+    if (this.match("null")) {
+      return {
+        kind: "NullLiteral",
+        span: this.previous().span,
+      };
+    }
+
     if (this.match("identifier")) {
       const token = this.previous();
       return {
@@ -238,6 +349,76 @@ class Parser {
     }
 
     throw this.error(this.peek(), "expected expression");
+  }
+
+  private bindingPattern(): BindingPattern {
+    if (this.match("identifier")) {
+      const token = this.previous();
+      return {
+        kind: "IdentifierPattern",
+        name: token.lexeme,
+        span: token.span,
+      };
+    }
+
+    if (this.match("lBrace")) {
+      return this.recordPattern(this.previous().span);
+    }
+
+    if (this.match("lBracket")) {
+      return this.listPattern(this.previous().span);
+    }
+
+    throw this.error(this.peek(), "expected binding pattern");
+  }
+
+  private recordPattern(start: SourceSpan): BindingPattern {
+    const fields: RecordPatternField[] = [];
+
+    if (!this.check("rBrace")) {
+      do {
+        const nameToken = this.consume("identifier", "expected record pattern field name");
+        let pattern: BindingPattern = {
+          kind: "IdentifierPattern",
+          name: nameToken.lexeme,
+          span: nameToken.span,
+        };
+
+        if (this.match("colon")) {
+          pattern = this.bindingPattern();
+        }
+
+        fields.push({
+          name: nameToken.lexeme,
+          pattern,
+          span: mergeSpans(nameToken.span, pattern.span),
+        });
+      } while (this.match("comma"));
+    }
+
+    const close = this.consume("rBrace", "expected `}` after record pattern");
+    return {
+      kind: "RecordPattern",
+      fields,
+      span: mergeSpans(start, close.span),
+    };
+  }
+
+  private listPattern(start: SourceSpan): BindingPattern {
+    const items: BindingPattern[] = [];
+
+    if (!this.check("rBracket")) {
+      do {
+        items.push(this.bindingPattern());
+      } while (this.match("comma"));
+    }
+
+    const close = this.consume("rBracket", "expected `]` after list pattern");
+    return {
+      kind: "ListPattern",
+      items,
+      span: mergeSpans(start, close.span),
+    };
   }
 
   private listExpression(start: SourceSpan): Expression {

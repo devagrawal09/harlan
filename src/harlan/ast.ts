@@ -10,8 +10,34 @@ export type Statement = LetDeclaration | FunctionDeclaration | ExpressionStateme
 
 export type LetDeclaration = {
   kind: "LetDeclaration";
-  name: string;
+  pattern: BindingPattern;
   value: Expression;
+  span: SourceSpan;
+};
+
+export type BindingPattern = IdentifierPattern | RecordPattern | ListPattern;
+
+export type IdentifierPattern = {
+  kind: "IdentifierPattern";
+  name: string;
+  span: SourceSpan;
+};
+
+export type RecordPattern = {
+  kind: "RecordPattern";
+  fields: RecordPatternField[];
+  span: SourceSpan;
+};
+
+export type RecordPatternField = {
+  name: string;
+  pattern: BindingPattern;
+  span: SourceSpan;
+};
+
+export type ListPattern = {
+  kind: "ListPattern";
+  items: BindingPattern[];
   span: SourceSpan;
 };
 
@@ -45,6 +71,10 @@ export type Expression =
   | StringLiteral
   | NumberLiteral
   | BooleanLiteral
+  | NullLiteral
+  | IfExpression
+  | BinaryExpression
+  | UnaryExpression
   | IdentifierExpression
   | ListExpression
   | RecordExpression
@@ -69,6 +99,36 @@ export type BooleanLiteral = {
   value: boolean;
   span: SourceSpan;
 };
+
+export type NullLiteral = {
+  kind: "NullLiteral";
+  span: SourceSpan;
+};
+
+export type IfExpression = {
+  kind: "IfExpression";
+  condition: Expression;
+  thenBranch: Expression;
+  elseBranch: Expression;
+  span: SourceSpan;
+};
+
+export type BinaryExpression = {
+  kind: "BinaryExpression";
+  operator: BinaryOperator;
+  left: Expression;
+  right: Expression;
+  span: SourceSpan;
+};
+
+export type UnaryExpression = {
+  kind: "UnaryExpression";
+  operator: "not";
+  argument: Expression;
+  span: SourceSpan;
+};
+
+export type BinaryOperator = "==" | "!=" | "<" | "<=" | ">" | ">=" | "and" | "or";
 
 export type IdentifierExpression = {
   kind: "IdentifierExpression";

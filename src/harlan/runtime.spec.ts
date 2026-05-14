@@ -7,6 +7,7 @@ import {
   ImportError,
   ParseError,
   RuntimeError,
+  type HarlanValue,
   parseHarlan,
   renderHarlanResult,
   renderHarlanValue,
@@ -38,6 +39,44 @@ test("parses import calls, bindings, functions, collections, calls, members, and
 
 test("rejects invalid syntax with source diagnostics", () => {
   assert.throws(() => parseHarlan("let = nope"), ParseError);
+});
+
+test("parses script logic expressions and destructuring patterns", () => {
+  const conditional = parseHarlan('if true then "a" else "b"');
+  assert.equal(conditional.statements[0]?.kind, "ExpressionStatement");
+  assert.equal(
+    conditional.statements[0]?.kind === "ExpressionStatement"
+      ? conditional.statements[0].expression.kind
+      : "",
+    "IfExpression",
+  );
+
+  const operators = parseHarlan("not false or 1 == 1 and 2 <= 3");
+  assert.equal(operators.statements[0]?.kind, "ExpressionStatement");
+  assert.equal(
+    operators.statements[0]?.kind === "ExpressionStatement"
+      ? operators.statements[0].expression.kind
+      : "",
+    "BinaryExpression",
+  );
+
+  const destructuring = parseHarlan(`
+    let { matches, nested: { inner } } = result
+    let [first, second] = matches
+  `);
+  assert.equal(destructuring.statements[0]?.kind, "LetDeclaration");
+  assert.equal(
+    destructuring.statements[0]?.kind === "LetDeclaration"
+      ? destructuring.statements[0].pattern.kind
+      : "",
+    "RecordPattern",
+  );
+  assert.equal(
+    destructuring.statements[1]?.kind === "LetDeclaration"
+      ? destructuring.statements[1].pattern.kind
+      : "",
+    "ListPattern",
+  );
 });
 
 test("evaluates import calls, user functions, records, and pipelines", async () => {
@@ -81,6 +120,106 @@ test("rejects duplicate immutable bindings", async () => {
         let value = "a"
         let value = "b"
         value
+      `),
+    RuntimeError,
+  );
+});
+
+test("evaluates conditionals without evaluating the unused branch", async () => {
+  const thenResult = await runHarlan('if true then "yes" else missing.name');
+  assert.equal(renderHarlanValue(thenResult.value), "yes");
+
+  const elseResult = await runHarlan('if false then missing.name else "no"');
+  assert.equal(renderHarlanValue(elseResult.value), "no");
+
+  await assert.rejects(() => runHarlan('if "x" then "yes" else "no"'), RuntimeError);
+});
+
+test("evaluates equality, comparison, boolean operators, and null", async () => {
+  const equality = await runHarlan(`
+    {
+      sameString: "a" == "a",
+      diffString: "a" != "b",
+      sameList: [1, 2] == [1, 2],
+      sameRecord: { a: 1 } == { a: 1 },
+      nullEqual: null == null
+    }
+  `);
+  assertRecordBooleans(equality.value, [
+    "sameString",
+    "diffString",
+    "sameList",
+    "sameRecord",
+    "nullEqual",
+  ]);
+
+  const comparison = await runHarlan(`
+    {
+      lt: 1 < 2,
+      lte: 2 <= 2,
+      gt: "b" > "a",
+      gte: "b" >= "b"
+    }
+  `);
+  assertRecordBooleans(comparison.value, ["lt", "lte", "gt", "gte"]);
+
+  assert.equal(renderHarlanValue((await runHarlan("false and missing.name")).value), "false");
+  assert.equal(renderHarlanValue((await runHarlan("true or missing.name")).value), "true");
+  assert.equal(renderHarlanValue((await runHarlan("not false")).value), "true");
+
+  await assert.rejects(() => runHarlan('1 < "2"'), RuntimeError);
+  await assert.rejects(() => runHarlan('"yes" and true'), RuntimeError);
+  await assert.rejects(() => runHarlan('not "yes"'), RuntimeError);
+});
+
+test("evaluates record, list, alias, missing, and nested destructuring", async () => {
+  const record = await runHarlan(`
+    let result = { matches: ["a"], truncated: false }
+    let { matches, truncated } = result
+    matches
+  `);
+  assert.equal(renderHarlanValue(record.value), '["a"]');
+
+  const alias = await runHarlan(`
+    let result = { matches: ["a"] }
+    let { matches: found } = result
+    found
+  `);
+  assert.equal(renderHarlanValue(alias.value), '["a"]');
+
+  const missingField = await runHarlan(`
+    let { missing } = {}
+    missing
+  `);
+  assert.equal(renderHarlanValue(missingField.value), "null");
+
+  const list = await runHarlan(`
+    let [first, second, third] = ["a", "b"]
+    third
+  `);
+  assert.equal(renderHarlanValue(list.value), "null");
+
+  const nested = await runHarlan(`
+    let { outer: { inner } } = { outer: { inner: "value" } }
+    inner
+  `);
+  assert.equal(renderHarlanValue(nested.value), "value");
+
+  await assert.rejects(
+    () =>
+      runHarlan(`
+        let { a, b: a } = { a: 1, b: 2 }
+        a
+      `),
+    RuntimeError,
+  );
+
+  await assert.rejects(
+    () =>
+      runHarlan(`
+        let existing = "keep"
+        let { a: existing } = { a: "replace" }
+        existing
       `),
     RuntimeError,
   );
@@ -412,13 +551,30 @@ test("agent usefulness acceptance examples work", async () => {
       let fs = import("fs")
       let format = import("format")
 
-      fs.search("src", "execute_harlan").matches
-        |> format.table()
+      let { matches, truncated } = fs.search("src", "execute_harlan")
+
+      if truncated then
+        "too many results"
+      else
+        format.table(matches)
     `,
     { cwd: process.cwd() },
   );
   assert.equal(search.value.kind, "string");
   assert.ok(search.value.kind === "string" && search.value.value.includes("src/cli.ts"));
+
+  const existence = await runHarlan(
+    `
+      let fs = import("fs")
+
+      if fs.exists("README.md") and fs.info("README.md").size > 0 then
+        "ready"
+      else
+        "missing"
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(renderHarlanValue(existence.value), "ready");
 
   const glob = await runHarlan(
     `
@@ -433,3 +589,13 @@ test("agent usefulness acceptance examples work", async () => {
   assert.equal(glob.value.kind, "string");
   assert.ok(glob.value.kind === "string" && glob.value.value.includes("src/harlan/runtime.ts"));
 });
+
+function assertRecordBooleans(value: HarlanValue, keys: string[]): void {
+  assert.equal(value.kind, "record");
+  for (const key of keys) {
+    const field: HarlanValue | undefined =
+      value.kind === "record" ? value.fields.get(key) : undefined;
+    assert.equal(field?.kind, "boolean");
+    assert.equal(field?.kind === "boolean" ? field.value : false, true);
+  }
+}
