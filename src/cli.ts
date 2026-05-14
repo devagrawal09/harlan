@@ -5,6 +5,7 @@ import { Agent } from "@mastra/core/agent";
 import type { AgentChunkType } from "@mastra/core/stream";
 import { createTool } from "@mastra/core/tools";
 import z from "zod";
+import { formatUnknownError, renderHarlanValue, runHarlan } from "./harlan/index.ts";
 
 type CommandContext = {
   args: string[];
@@ -70,12 +71,22 @@ async function readStdin(): Promise<string> {
 }
 
 const execute_harlan = createTool({
-  id: ``,
-  description: ``,
-  inputSchema: z.object({
-    code: z.string(),
-  }),
-  execute: async ({ code }) => code,
+  id: `execute_harlan`,
+  description: `Parse and execute Harlan code for deterministic tool workflows.`,
+  inputSchema: z.object({ code: z.string() }),
+  execute: async ({ code }) => {
+    try {
+      const result = await runHarlan(code, {
+        cwd: process.cwd(),
+        env: process.env,
+        allowShell: true,
+      });
+      const output = result.output.length > 0 ? `${result.output.join("\n")}\n` : "";
+      return `${output}${renderHarlanValue(result.value)}`;
+    } catch (error) {
+      return formatUnknownError(error);
+    }
+  },
 });
 
 function createAgent(model: string): Agent {
@@ -86,6 +97,15 @@ function createAgent(model: string): Agent {
       "An agent that accomplishes tasks by writing code in a REPL that calls tools programmatically.",
     instructions: [
       "You are a pragmatic AI assistant with access to the Harlan REPL, a way to write and execute code in a custom language called Harlan made for you.",
+      `Write Harlan code when you need to inspect files, compose tool calls, or produce repeatable workflows.
+
+Example:
+let fs = import("fs")
+let text = import("text")
+
+fs.read("README.md")
+  |> text.lines()
+  |> text.take(5)`,
     ],
     model,
     tools: { execute_harlan },

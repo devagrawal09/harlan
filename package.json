@@ -12,6 +12,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "start": "node ./src/cli.ts",
+    "test": "node --test src/**/*.spec.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {
