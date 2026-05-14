@@ -7,13 +7,21 @@
     "harlan": "./src/cli.ts"
   },
   "scripts": {
+    "build": "npm run build:web",
+    "build:web": "vite build --config web/vite.config.ts",
+    "dev": "concurrently -k -n server,web \"npm run dev:server:portless\" \"npm run dev:web:portless\"",
+    "dev:server": "node --watch ./src/server.ts",
+    "dev:server:portless": "portless api.harlan node --watch ./src/server.ts",
+    "dev:web": "vite --config web/vite.config.ts",
+    "dev:web:portless": "portless harlan vite --config web/vite.config.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
+    "server": "node ./src/server.ts",
     "start": "node ./src/cli.ts",
-    "test": "node --test src/**/*.spec.ts",
-    "typecheck": "tsc --noEmit"
+    "test": "node --test \"src/**/*.spec.ts\"",
+    "typecheck": "tsc --noEmit && tsc -p web/tsconfig.json --noEmit"
   },
   "engines": {
     "node": ">=23.6.0"
@@ -21,13 +29,22 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^25.8.0",
+    "concurrently": "^9.2.1",
     "eslint": "^10.3.0",
+    "portless": "^0.13.0",
     "prettier": "^3.8.3",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.3"
   },
   "dependencies": {
+    "@hono/node-server": "^2.0.2",
     "@mastra/core": "^1.33.1",
-    "dotenv": "^17.4.2"
+    "@solidjs/web": "^2.0.0-beta.13",
+    "dotenv": "^17.4.2",
+    "hono": "^4.12.18",
+    "solid-js": "^2.0.0-beta.13",
+    "vite": "^8.0.13",
+    "vite-plugin-solid": "^3.0.0-next.5",
+    "zod": "^4.4.3"
   }
 }
