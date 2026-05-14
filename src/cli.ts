@@ -1,11 +1,8 @@
 #!/usr/bin/env node
 
 import "dotenv/config";
-import { Agent } from "@mastra/core/agent";
 import type { AgentChunkType } from "@mastra/core/stream";
-import { createTool } from "@mastra/core/tools";
-import z from "zod";
-import { formatUnknownError, renderHarlanResult, runHarlan } from "./harlan/index.ts";
+import { assertProviderConfig, createHarlanAgent, defaultModel } from "./agent.ts";
 
 type CommandContext = {
   args: string[];
@@ -15,8 +12,6 @@ type CliOptions = {
   model: string;
   promptParts: string[];
 };
-
-const defaultModel = process.env.HARLAN_MODEL ?? "openrouter/google/gemini-2.0-flash-lite-001";
 
 function printHelp(): void {
   console.log(`harlan
@@ -70,77 +65,10 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8").trim();
 }
 
-const execute_harlan = createTool({
-  id: `execute_harlan`,
-  description: `Parse and execute Harlan code for deterministic tool workflows.`,
-  inputSchema: z.object({ code: z.string() }),
-  execute: async ({ code }) => {
-    try {
-      const result = await runHarlan(code, {
-        cwd: process.cwd(),
-        env: process.env,
-        allowShell: true,
-        maxOutputChars: 20_000,
-      });
-      return renderHarlanResult(result, { maxChars: 20_000 });
-    } catch (error) {
-      return formatUnknownError(error);
-    }
-  },
-});
-
-function createAgent(model: string): Agent {
-  return new Agent({
-    id: "harlan-agent",
-    name: "Harlan Agent",
-    description:
-      "An agent that accomplishes tasks by writing code in a REPL that calls tools programmatically.",
-    instructions: [
-      "You are a pragmatic AI assistant with access to the Harlan REPL, a way to write and execute code in a custom language called Harlan made for you.",
-      `Write Harlan code when you need to read files, list or search a codebase, extract structured results, compose tool calls, or produce repeatable workflows.
-
-Prefer fs.glob and fs.search for codebase inspection before shell.run. Use shell.run only when actual shell behavior is needed. Keep scripts small and return the final useful value. Import modules explicitly with let module = import("module").
-
-Example: read README
-let fs = import("fs")
-let text = import("text")
-
-fs.read("README.md")
-  |> text.lines()
-  |> text.take(5)
-
-Example: search code
-let fs = import("fs")
-let format = import("format")
-
-fs.search("src", "execute_harlan").matches
-  |> format.table()
-
-Example: list TypeScript files
-let fs = import("fs")
-let format = import("format")
-
-fs.glob("src/**/*.ts")
-  |> format.lines()`,
-    ],
-    model,
-    tools: { execute_harlan },
-  });
-}
-
-function assertProviderConfig(model: string): void {
-  const provider = model.split("/", 1)[0];
-
-  if (provider === "openai" && !process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY is required for OpenAI models.");
-  }
-
-  if (provider === "openrouter" && !process.env.OPENROUTER_API_KEY) {
-    throw new Error("OPENROUTER_API_KEY is required for OpenRouter models.");
-  }
-}
-
-async function streamAgentOutput(agent: Agent, prompt: string): Promise<void> {
+async function streamAgentOutput(
+  agent: ReturnType<typeof createHarlanAgent>,
+  prompt: string,
+): Promise<void> {
   const stream = await agent.stream(prompt);
 
   for await (const chunk of stream.fullStream as AsyncIterable<AgentChunkType>) {
@@ -178,7 +106,7 @@ async function main({ args }: CommandContext): Promise<void> {
   }
 
   assertProviderConfig(model);
-  await streamAgentOutput(createAgent(model), prompt);
+  await streamAgentOutput(createHarlanAgent(model), prompt);
 }
 
 main({ args: process.argv.slice(2) }).catch((error: unknown) => {
