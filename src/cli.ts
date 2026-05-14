@@ -1,18 +1,112 @@
 #!/usr/bin/env node
 
+import "dotenv/config";
+import { Agent } from "@mastra/core/agent";
+import type { AgentChunkType } from "@mastra/core/stream";
+
 type CommandContext = {
   args: string[];
 };
+
+type CliOptions = {
+  model: string;
+  promptParts: string[];
+};
+
+const defaultModel = process.env.HARLAN_MODEL ?? "openrouter/google/gemini-2.0-flash-lite-001";
 
 function printHelp(): void {
   console.log(`harlan
 
 Usage:
-  harlan [options] [args...]
+  harlan [options] <task...>
+  echo "<task>" | harlan [options]
 
 Options:
-  -h, --help     Show this help message
-  -v, --version  Show package version`);
+  -h, --help           Show this help message
+  -v, --version        Show package version
+  -m, --model <model>  Model to use (default: $HARLAN_MODEL or ${defaultModel})`);
+}
+
+function parseArgs(args: string[]): CliOptions {
+  const promptParts: string[] = [];
+  let model = defaultModel;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (arg === "-m" || arg === "--model") {
+      const value = args[index + 1];
+
+      if (!value) {
+        throw new Error(`Missing value for ${arg}`);
+      }
+
+      model = value;
+      index += 1;
+      continue;
+    }
+
+    promptParts.push(arg);
+  }
+
+  return { model, promptParts };
+}
+
+async function readStdin(): Promise<string> {
+  if (process.stdin.isTTY) {
+    return "";
+  }
+
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks).toString("utf8").trim();
+}
+
+function createAgent(model: string): Agent {
+  return new Agent({
+    id: "harlan-cli-agent",
+    name: "Harlan CLI Agent",
+    description: "A command-line agent that completes user-provided tasks.",
+    instructions: [
+      "You are a pragmatic command-line assistant.",
+      "Complete the user's task directly and concisely.",
+      "When you cannot perform an action from the CLI context, explain the blocker and the next concrete step.",
+    ],
+    model,
+  });
+}
+
+function assertProviderConfig(model: string): void {
+  const provider = model.split("/", 1)[0];
+
+  if (provider === "openai" && !process.env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY is required for OpenAI models.");
+  }
+
+  if (provider === "openrouter" && !process.env.OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY is required for OpenRouter models.");
+  }
+}
+
+async function streamAgentOutput(agent: Agent, prompt: string): Promise<void> {
+  const stream = await agent.stream(prompt);
+
+  for await (const chunk of stream.fullStream as AsyncIterable<AgentChunkType>) {
+    if (chunk.type === "text-delta") {
+      process.stdout.write(chunk.payload.text);
+    }
+  }
+
+  if (stream.error) {
+    throw stream.error;
+  }
+
+  process.stdout.write("\n");
 }
 
 async function main({ args }: CommandContext): Promise<void> {
@@ -27,7 +121,17 @@ async function main({ args }: CommandContext): Promise<void> {
     return;
   }
 
-  console.log(args.length ? args.join(" ") : "harlan");
+  const { model, promptParts } = parseArgs(args);
+  const prompt = promptParts.join(" ").trim() || (await readStdin());
+
+  if (!prompt) {
+    printHelp();
+    process.exitCode = 1;
+    return;
+  }
+
+  assertProviderConfig(model);
+  await streamAgentOutput(createAgent(model), prompt);
 }
 
 main({ args: process.argv.slice(2) }).catch((error: unknown) => {
