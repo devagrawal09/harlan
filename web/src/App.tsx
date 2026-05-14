@@ -2,11 +2,19 @@ import { createSignal } from "solid-js";
 import { For, Show } from "@solidjs/web";
 import { SseEventParser, type SseEvent } from "./events";
 
+declare const __HARLAN_API_URL__: string;
+
 type RunStatus = "idle" | "running" | "done" | "error";
 
 type TimelineEvent = SseEvent & {
   id: number;
 };
+
+const apiBaseUrl = (
+  import.meta.env.VITE_HARLAN_API_URL ||
+  __HARLAN_API_URL__ ||
+  "http://localhost:3000"
+).replace(/\/$/, "");
 
 function readChunkText(event: SseEvent): string {
   if (event.event !== "text-delta") {
@@ -56,7 +64,7 @@ export default function App() {
     setError("");
 
     try {
-      const response = await fetch("/api/runs", {
+      const response = await fetch(`${apiBaseUrl}/api/runs`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

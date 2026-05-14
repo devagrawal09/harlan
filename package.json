@@ -9,11 +9,9 @@
   "scripts": {
     "build": "npm run build:web",
     "build:web": "vite build --config web/vite.config.ts",
-    "dev": "concurrently -k -n server,web \"npm run dev:server:portless\" \"npm run dev:web:portless\"",
-    "dev:server": "node --watch ./src/server.ts",
-    "dev:server:portless": "portless api.harlan node --watch ./src/server.ts",
-    "dev:web": "vite --config web/vite.config.ts",
-    "dev:web:portless": "portless harlan vite --config web/vite.config.ts",
+    "dev": "concurrently -k -n server,web \"npm run dev:server\" \"npm run dev:web\"",
+    "dev:server": "PORT=43117 HOST=127.0.0.1 node --watch ./src/server.ts",
+    "dev:web": "vite --config web/vite.config.ts --port 3167 --strictPort --host 127.0.0.1",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",
@@ -31,7 +29,6 @@
     "@types/node": "^25.8.0",
     "concurrently": "^9.2.1",
     "eslint": "^10.3.0",
-    "portless": "^0.13.0",
     "prettier": "^3.8.3",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.3"

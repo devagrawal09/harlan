@@ -4,6 +4,7 @@ import "dotenv/config";
 import { serve } from "@hono/node-server";
 import type { AgentChunkType } from "@mastra/core/stream";
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { pathToFileURL } from "node:url";
 import z from "zod";
@@ -28,14 +29,33 @@ const runRequestSchema = z.object({
   model: z.string().trim().min(1).optional(),
 });
 
+const allowedOriginPatterns = [
+  /^https?:\/\/localhost(?::\d+)?$/,
+  /^https?:\/\/127\.0\.0\.1(?::\d+)?$/,
+  /^https:\/\/harlan\.localhost(?::\d+)?$/,
+];
+
 function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function resolveCorsOrigin(origin: string): string | undefined {
+  return allowedOriginPatterns.some((pattern) => pattern.test(origin)) ? origin : undefined;
 }
 
 export function createServer(options: ServerOptions = {}): Hono {
   const createAgent = options.createAgent ?? createHarlanAgent;
   const env = options.env ?? process.env;
   const app = new Hono();
+
+  app.use(
+    "/api/*",
+    cors({
+      origin: resolveCorsOrigin,
+      allowHeaders: ["Content-Type"],
+      allowMethods: ["GET", "POST", "OPTIONS"],
+    }),
+  );
 
   app.get("/api/health", (c) =>
     c.json({

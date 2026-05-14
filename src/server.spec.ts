@@ -36,6 +36,33 @@ test("GET /api/health returns ok", async () => {
   assert.deepEqual(await response.json(), { ok: true });
 });
 
+test("API routes allow expected browser origins with CORS", async () => {
+  const app = createServer();
+
+  const response = await app.request("/api/health", {
+    headers: {
+      Origin: "http://localhost:3167",
+    },
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("access-control-allow-origin"), "http://localhost:3167");
+
+  const preflight = await app.request("/api/runs", {
+    method: "OPTIONS",
+    headers: {
+      Origin: "http://localhost:5173",
+      "Access-Control-Request-Method": "POST",
+      "Access-Control-Request-Headers": "Content-Type",
+    },
+  });
+
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-allow-origin"), "http://localhost:5173");
+  assert.match(preflight.headers.get("access-control-allow-methods") ?? "", /POST/);
+  assert.match(preflight.headers.get("access-control-allow-headers") ?? "", /Content-Type/);
+});
+
 test("POST /api/runs validates request body", async () => {
   const app = createServer();
 
