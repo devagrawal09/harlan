@@ -73,21 +73,22 @@ const execute_harlan = createTool({
   id: ``,
   description: ``,
   inputSchema: z.object({
-    code: z.string()
+    code: z.string(),
   }),
-  execute: async ({ code }) => {}
-})
+  execute: async ({ code }) => code,
+});
 
 function createAgent(model: string): Agent {
   return new Agent({
     id: "harlan-agent",
     name: "Harlan Agent",
-    description: "An agent that accomplishes tasks by writing code in a REPL that calls tools programmatically.",
+    description:
+      "An agent that accomplishes tasks by writing code in a REPL that calls tools programmatically.",
     instructions: [
       "You are a pragmatic AI assistant with access to the Harlan REPL, a way to write and execute code in a custom language called Harlan made for you.",
     ],
     model,
-    tools: {execute_harlan }
+    tools: { execute_harlan },
   });
 }
 
