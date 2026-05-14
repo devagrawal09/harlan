@@ -8,6 +8,7 @@ import {
   ParseError,
   RuntimeError,
   parseHarlan,
+  renderHarlanResult,
   renderHarlanValue,
   runHarlan,
 } from "./index.ts";
@@ -204,4 +205,231 @@ test("acceptance example returns first README lines", async () => {
 
   assert.equal(result.value.kind, "list");
   assert.equal(result.value.items.length, 3);
+});
+
+test("fs.glob discovers sorted files and rejects escaping cwd", async () => {
+  const markdown = await runHarlan(
+    `
+      let fs = import("fs")
+      fs.glob("*.md")
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(markdown.value.kind, "list");
+  assert.ok(
+    markdown.value.items.some((item) => item.kind === "string" && item.value === "README.md"),
+  );
+
+  const source = await runHarlan(
+    `
+      let fs = import("fs")
+      fs.glob("src/**/*.ts")
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(source.value.kind, "list");
+  const paths = source.value.items.map((item) => (item.kind === "string" ? item.value : ""));
+  assert.ok(paths.includes("src/harlan/runtime.ts"));
+  assert.deepEqual(paths, [...paths].sort());
+  assert.ok(!paths.some((item) => item.includes("node_modules")));
+
+  await assert.rejects(
+    () =>
+      runHarlan(
+        `
+          let fs = import("fs")
+          fs.glob("../*.ts")
+        `,
+        { cwd: process.cwd() },
+      ),
+    RuntimeError,
+  );
+});
+
+test("fs.search returns structured matches for directories and files", async () => {
+  const directory = await runHarlan(
+    `
+      let fs = import("fs")
+      fs.search("src", "execute_harlan")
+    `,
+    { cwd: process.cwd() },
+  );
+
+  assert.equal(directory.value.kind, "record");
+  const matches = directory.value.fields.get("matches");
+  const truncated = directory.value.fields.get("truncated");
+  assert.equal(matches?.kind, "list");
+  assert.equal(truncated?.kind, "boolean");
+  assert.ok(matches?.kind === "list" && matches.items.length > 0);
+
+  const first = matches?.kind === "list" ? matches.items[0] : null;
+  assert.equal(first?.kind, "record");
+  assert.equal(first?.kind === "record" ? first.fields.get("path")?.kind : null, "string");
+  assert.equal(first?.kind === "record" ? first.fields.get("line")?.kind : null, "number");
+  assert.equal(first?.kind === "record" ? first.fields.get("column")?.kind : null, "number");
+  assert.equal(first?.kind === "record" ? first.fields.get("text")?.kind : null, "string");
+
+  const file = await runHarlan(
+    `
+      let fs = import("fs")
+      fs.search("src/cli.ts", "execute_harlan")
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(file.value.kind, "record");
+  assert.equal(file.value.fields.get("matches")?.kind, "list");
+
+  await assert.rejects(
+    () =>
+      runHarlan(
+        `
+          let fs = import("fs")
+          fs.search("missing", "x")
+        `,
+        { cwd: process.cwd() },
+      ),
+    RuntimeError,
+  );
+  await assert.rejects(
+    () =>
+      runHarlan(
+        `
+          let fs = import("fs")
+          fs.search("../", "x")
+        `,
+        { cwd: process.cwd() },
+      ),
+    RuntimeError,
+  );
+});
+
+test("fs.info returns file and directory metadata", async () => {
+  const file = await runHarlan(
+    `
+      let fs = import("fs")
+      fs.info("README.md")
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(file.value.kind, "record");
+  const fileKind = file.value.fields.get("kind");
+  const fileSize = file.value.fields.get("size");
+  assert.equal(fileKind?.kind, "string");
+  assert.equal(fileKind.kind === "string" ? fileKind.value : "", "file");
+  assert.equal(fileSize?.kind, "number");
+  assert.ok(fileSize.kind === "number" && fileSize.value > 0);
+
+  const directory = await runHarlan(
+    `
+      let fs = import("fs")
+      fs.info("src")
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(directory.value.kind, "record");
+  const directoryKind = directory.value.fields.get("kind");
+  assert.equal(directoryKind?.kind, "string");
+  assert.equal(directoryKind.kind === "string" ? directoryKind.value : "", "directory");
+});
+
+test("text helpers support common string and list checks", async () => {
+  const result = await runHarlan(
+    `
+      let text = import("text")
+      {
+        contains: text.contains("abc", "b"),
+        trim: text.trim("  abc  "),
+        lower: text.lower("ABC"),
+        includes: text.includes(["a", "b"], "b")
+      }
+    `,
+    { cwd: process.cwd() },
+  );
+
+  assert.equal(result.value.kind, "record");
+  const contains = result.value.fields.get("contains");
+  const trim = result.value.fields.get("trim");
+  const lower = result.value.fields.get("lower");
+  const includes = result.value.fields.get("includes");
+  assert.equal(contains?.kind === "boolean" && contains.value, true);
+  assert.equal(trim?.kind === "string" ? trim.value : "", "abc");
+  assert.equal(lower?.kind === "string" ? lower.value : "", "abc");
+  assert.equal(includes?.kind === "boolean" && includes.value, true);
+});
+
+test("format helpers produce json, lines, and markdown tables", async () => {
+  const json = await runHarlan(
+    `
+      let format = import("format")
+      format.json({ path: "README.md", count: 3 })
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(json.value.kind, "string");
+  assert.ok(json.value.kind === "string" && json.value.value.includes('"path"'));
+  assert.ok(json.value.kind === "string" && json.value.value.includes('"count"'));
+
+  const lines = await runHarlan(
+    `
+      let format = import("format")
+      format.lines(["a", "b"])
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(renderHarlanValue(lines.value), "a\nb");
+
+  const table = await runHarlan(
+    `
+      let format = import("format")
+      format.table([{ path: "a", line: 1 }])
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(table.value.kind, "string");
+  assert.ok(table.value.kind === "string" && table.value.value.includes("| path | line |"));
+});
+
+test("renderHarlanResult includes output, value, and truncation", () => {
+  const rendered = renderHarlanResult({
+    output: ["side effect"],
+    value: { kind: "string", value: "final value" },
+  });
+  assert.equal(rendered, "side effect\nfinal value");
+
+  const truncated = renderHarlanResult(
+    {
+      output: [],
+      value: { kind: "string", value: "abcdefghij" },
+    },
+    { maxChars: 4 },
+  );
+  assert.equal(truncated, "abcd\n... truncated after 4 characters");
+});
+
+test("agent usefulness acceptance examples work", async () => {
+  const search = await runHarlan(
+    `
+      let fs = import("fs")
+      let format = import("format")
+
+      fs.search("src", "execute_harlan").matches
+        |> format.table()
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(search.value.kind, "string");
+  assert.ok(search.value.kind === "string" && search.value.value.includes("src/cli.ts"));
+
+  const glob = await runHarlan(
+    `
+      let fs = import("fs")
+      let format = import("format")
+
+      fs.glob("src/**/*.ts")
+        |> format.lines()
+    `,
+    { cwd: process.cwd() },
+  );
+  assert.equal(glob.value.kind, "string");
+  assert.ok(glob.value.kind === "string" && glob.value.value.includes("src/harlan/runtime.ts"));
 });

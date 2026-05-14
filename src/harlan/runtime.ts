@@ -8,12 +8,7 @@ import type {
 } from "./ast.ts";
 import { ImportError, RuntimeError } from "./errors.ts";
 import { parseHarlan } from "./parser.ts";
-import {
-  createStdlib,
-  renderHarlanValue,
-  type HarlanModule,
-  type HarlanRunOptions,
-} from "./stdlib.ts";
+import { createStdlib, type HarlanModule, type HarlanRunOptions } from "./stdlib.ts";
 import type { SourceSpan } from "./tokens.ts";
 
 export type HarlanCallable = (
@@ -38,7 +33,7 @@ export type HarlanRunResult = {
 
 export type RuntimeContext = {
   source: string;
-  options: Required<Pick<HarlanRunOptions, "cwd" | "allowShell">> & {
+  options: Required<Pick<HarlanRunOptions, "cwd" | "allowShell" | "maxOutputChars">> & {
     env: NodeJS.ProcessEnv;
   };
   output: string[];
@@ -65,6 +60,7 @@ export async function evaluateProgram(
       cwd: options.cwd ?? process.cwd(),
       env: options.env ?? process.env,
       allowShell: options.allowShell ?? false,
+      maxOutputChars: options.maxOutputChars ?? 20_000,
     },
     output: [],
   };
@@ -78,8 +74,6 @@ export async function evaluateProgram(
 
   return { value, output: context.output };
 }
-
-export { renderHarlanValue };
 
 async function evaluateStatement(
   statement: Statement,

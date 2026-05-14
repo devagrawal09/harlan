@@ -7,11 +7,6 @@ export {
   RuntimeError,
 } from "./errors.ts";
 export { parseHarlan } from "./parser.ts";
-export {
-  evaluateProgram,
-  renderHarlanValue,
-  runHarlan,
-  type HarlanRunResult,
-  type HarlanValue,
-} from "./runtime.ts";
+export { harlanValueToJson, renderHarlanResult, renderHarlanValue } from "./render.ts";
+export { evaluateProgram, runHarlan, type HarlanRunResult, type HarlanValue } from "./runtime.ts";
 export type { HarlanRunOptions } from "./stdlib.ts";

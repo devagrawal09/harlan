@@ -1,0 +1,5 @@
+let fs = import("fs")
+let format = import("format")
+
+fs.glob("src/**/*.ts")
+  |> format.lines()

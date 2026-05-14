@@ -110,6 +110,9 @@ fs.cwd()
 fs.read("README.md")
 fs.list(".")
 fs.exists("README.md")
+fs.glob("src/**/*.ts")
+fs.search("src", "execute_harlan")
+fs.info("README.md")
 ```
 
 `text` provides small text/list helpers:
@@ -120,6 +123,20 @@ let text = import("text")
 text.lines("a\nb")
 text.join(["a", "b"], ",")
 text.take(["a", "b", "c"], 2)
+text.contains("abc", "b")
+text.trim("  abc  ")
+text.lower("ABC")
+text.includes(["a", "b"], "b")
+```
+
+`format` turns Harlan values into readable strings:
+
+```harlan
+let format = import("format")
+
+format.json({ path: "README.md", count: 3 })
+format.lines(["README.md", "package.json"])
+format.table([{ path: "src/cli.ts", line: 74 }])
 ```
 
 `shell` runs local shell commands when shell execution is enabled by the host:
@@ -130,12 +147,60 @@ let shell = import("shell")
 shell.run("printf hello")
 ```
 
+| Module   | Functions                                                        |
+| -------- | ---------------------------------------------------------------- |
+| `fs`     | `cwd`, `read`, `list`, `exists`, `glob`, `search`, `info`        |
+| `text`   | `lines`, `join`, `take`, `contains`, `trim`, `lower`, `includes` |
+| `format` | `json`, `lines`, `table`                                         |
+| `shell`  | `run`                                                            |
+
+## Agent Workflow Examples
+
+Prefer Harlan's built-in inspection helpers before reaching for shell commands. Use `fs.glob` for file discovery, `fs.search` for code search, and `format.table` for compact structured results. Use `shell.run` only when the built-in modules are not enough.
+
+Search code and return a Markdown table:
+
+```harlan
+let fs = import("fs")
+let format = import("format")
+
+fs.search("src", "execute_harlan").matches
+  |> format.table()
+```
+
+List source files:
+
+```harlan
+let fs = import("fs")
+let format = import("format")
+
+fs.glob("src/**/*.ts")
+  |> format.lines()
+```
+
+Summarize the beginning of the README:
+
+```harlan
+let fs = import("fs")
+let text = import("text")
+
+fs.read("README.md")
+  |> text.lines()
+  |> text.take(10)
+```
+
+Example scripts live in `examples/`:
+
+- `examples/readme-summary.harlan`
+- `examples/search-code.harlan`
+- `examples/list-source.harlan`
+
 ## Runtime API
 
 The language can be used directly from TypeScript:
 
 ```ts
-import { renderHarlanValue, runHarlan } from "./src/harlan/index.ts";
+import { renderHarlanResult, runHarlan } from "./src/harlan/index.ts";
 
 const result = await runHarlan(
   `
@@ -149,7 +214,7 @@ const result = await runHarlan(
   { cwd: process.cwd(), allowShell: true },
 );
 
-console.log(renderHarlanValue(result.value));
+console.log(renderHarlanResult(result));
 ```
 
 ## Development

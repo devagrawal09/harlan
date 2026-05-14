@@ -3,3 +3,5 @@ dist/
 build/
 coverage/
 package-lock.json
+.repos/
+examples/*.harlan

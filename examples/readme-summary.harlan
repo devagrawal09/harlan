@@ -1,0 +1,6 @@
+let fs = import("fs")
+let text = import("text")
+
+fs.read("README.md")
+  |> text.lines()
+  |> text.take(10)
