@@ -3,6 +3,8 @@
 import "dotenv/config";
 import { Agent } from "@mastra/core/agent";
 import type { AgentChunkType } from "@mastra/core/stream";
+import { createTool } from "@mastra/core/tools";
+import z from "zod";
 
 type CommandContext = {
   args: string[];
@@ -67,17 +69,25 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8").trim();
 }
 
+const execute_harlan = createTool({
+  id: ``,
+  description: ``,
+  inputSchema: z.object({
+    code: z.string()
+  }),
+  execute: async ({ code }) => {}
+})
+
 function createAgent(model: string): Agent {
   return new Agent({
-    id: "harlan-cli-agent",
-    name: "Harlan CLI Agent",
-    description: "A command-line agent that completes user-provided tasks.",
+    id: "harlan-agent",
+    name: "Harlan Agent",
+    description: "An agent that accomplishes tasks by writing code in a REPL that calls tools programmatically.",
     instructions: [
-      "You are a pragmatic command-line assistant.",
-      "Complete the user's task directly and concisely.",
-      "When you cannot perform an action from the CLI context, explain the blocker and the next concrete step.",
+      "You are a pragmatic AI assistant with access to the Harlan REPL, a way to write and execute code in a custom language called Harlan made for you.",
     ],
     model,
+    tools: {execute_harlan }
   });
 }
 
