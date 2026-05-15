@@ -3,10 +3,16 @@ import {
   createSignal,
   createStore,
   isPending,
-  onCleanup,
   refresh,
+  untrack,
 } from "solid-js";
 import { For, Show } from "@solidjs/web";
+import {
+  domainEventNames,
+  isDomainEventName,
+  type DomainEventName,
+  type EventLogItem,
+} from "../../events";
 import { SseEventParser, type SseEvent } from "./events";
 
 declare const __HARLAN_API_URL__: string;
@@ -18,97 +24,41 @@ type SessionSummary = {
   title: string;
   createdAt: string;
   updatedAt: string;
-  lastRunStatus?: RunStatus;
-};
-
-type RunRecord = {
-  id: string;
-  sessionId: string;
-  prompt: string;
-  model: string;
-  status: RunStatus;
-  answer: string;
-  error?: string;
-  startedAt: string;
-  completedAt?: string;
-  events: Array<{
-    event: string;
-    data: string;
-    createdAt: string;
-  }>;
+  lastRunStatus?: Exclude<RunStatus, "idle">;
 };
 
 type SessionDetail = SessionSummary & {
   resourceId: string;
 };
 
-type TimelineEvent = SseEvent & {
-  id: number;
-};
-
 type SessionProjection = {
   session: SessionDetail | null;
-  runs: RunRecord[];
-  messages: unknown[];
-  events: TimelineEvent[];
+  events: DomainLogItem[];
   streamError: string;
-};
-
-type SessionsProjection = {
-  items: SessionSummary[];
-  error: string;
 };
 
 type SessionSnapshot = {
   session: SessionDetail | null;
-  runs: RunRecord[];
-  messages: unknown[];
+  events: DomainLogItem[];
 };
 
 type SessionUpdatedPayload = {
   session: SessionDetail | null;
 };
 
-type RunEventPayload = {
-  runId: string;
-  sessionId: string;
-  payload?: {
-    text?: unknown;
-  };
-  run?: RunRecord | null;
+type RunErrorPayload = {
   error?: string;
 };
+
+type DomainLogItem = {
+  [Name in DomainEventName]: EventLogItem<Name>;
+}[DomainEventName];
 
 const apiBaseUrl = (
   import.meta.env.VITE_HARLAN_API_URL ||
   __HARLAN_API_URL__ ||
   "http://localhost:3000"
 ).replace(/\/$/, "");
-
-function readChunkText(event: SseEvent): string {
-  if (event.event !== "text-delta") {
-    return "";
-  }
-
-  try {
-    const parsed = JSON.parse(event.data) as RunEventPayload;
-    return typeof parsed.payload?.text === "string" ? parsed.payload.text : "";
-  } catch {
-    return "";
-  }
-}
-
-function eventLabel(event: SseEvent): string {
-  if (event.event === "run-start") {
-    return "run started";
-  }
-
-  if (event.event === "text-delta") {
-    return "text";
-  }
-
-  return event.event;
-}
 
 async function readJson<T>(response: Response): Promise<T> {
   const text = await response.text();
@@ -142,174 +92,334 @@ async function createSessionRequest(title?: string): Promise<SessionDetail> {
 function emptySessionProjection(): SessionProjection {
   return {
     session: null,
-    runs: [],
-    messages: [],
     events: [],
     streamError: "",
   };
 }
 
-function replaceSessionProjection(draft: SessionProjection, next: SessionProjection): void {
-  draft.session = next.session;
-  draft.runs = next.runs;
-  draft.messages = next.messages;
-  draft.events = next.events;
-  draft.streamError = next.streamError;
+function readEventPayload<T>(event: SseEvent): T {
+  return JSON.parse(event.data) as T;
 }
 
-function readEventPayload<T>(event: SseEvent): T | null {
-  try {
-    return JSON.parse(event.data) as T;
-  } catch {
-    return null;
-  }
-}
-
-function upsertRun(runs: RunRecord[], run: RunRecord): RunRecord[] {
-  const index = runs.findIndex((item) => item.id === run.id);
-
-  if (index === -1) {
-    return [...runs, run].sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+function eventTitle(name: DomainEventName): string {
+  if (name === domainEventNames.sessionStarted) {
+    return "Session started";
   }
 
-  return runs.map((item) => (item.id === run.id ? run : item));
+  if (name === domainEventNames.userMessaged) {
+    return "User";
+  }
+
+  if (name === domainEventNames.agentExecuted) {
+    return "Harlan executed";
+  }
+
+  if (name === domainEventNames.executionCompleted) {
+    return "Execution completed";
+  }
+
+  return "Agent";
 }
 
-function updateRun(
-  runs: RunRecord[],
-  runId: string,
-  update: (run: RunRecord) => RunRecord,
-): RunRecord[] {
-  return runs.map((run) => (run.id === runId ? update(run) : run));
+type SessionSidebarProps = {
+  sessions: SessionSummary[];
+  loading: boolean;
+  selectedSessionId: string;
+  addSession: () => void;
+  selectSession: (sessionId: string) => void;
+};
+
+function SessionSidebar(props: SessionSidebarProps) {
+  return (
+    <aside class="session-pane" aria-label="Sessions">
+      <div class="session-header">
+        <h2>Sessions</h2>
+        <button
+          class="icon-button"
+          type="button"
+          onClick={props.addSession}
+          aria-label="New session"
+        >
+          +
+        </button>
+      </div>
+
+      <Show when={!props.loading} fallback={<span class="empty-state">Loading sessions</span>}>
+        <ol class="session-list">
+          <For each={props.sessions}>
+            {(item) => {
+              const active = createMemo(() => item.id === props.selectedSessionId);
+
+              return (
+                <li class={`session-item ${active() ? "session-item-active" : ""}`}>
+                  <button type="button" onClick={() => props.selectSession(item.id)}>
+                    <span>{item.title}</span>
+                    <time>{new Date(item.updatedAt).toLocaleString()}</time>
+                  </button>
+                </li>
+              );
+            }}
+          </For>
+        </ol>
+      </Show>
+    </aside>
+  );
 }
 
-function persistedTimelineEvents(runs: RunRecord[], nextId: () => number): TimelineEvent[] {
-  return runs.flatMap((run) =>
-    run.events.map((event) => ({
-      id: nextId(),
-      event: event.event,
-      data: event.data,
-    })),
+type SessionHeaderProps = {
+  session: SessionDetail | null;
+  status: RunStatus;
+  renameSession: (title: string) => Promise<void>;
+  deleteSession: () => Promise<void>;
+};
+
+function SessionHeader(props: SessionHeaderProps) {
+  const [draftTitle, setDraftTitle] = createSignal(() => props.session?.title ?? "");
+
+  async function renameCurrentSession() {
+    const current = props.session;
+    const title = draftTitle().trim();
+
+    if (!current || !title || title === current.title) {
+      setDraftTitle(current?.title ?? "");
+      return;
+    }
+
+    await props.renameSession(title);
+  }
+
+  return (
+    <header class="workspace-header">
+      <div class="toolbar">
+        <Show
+          when={props.session}
+          fallback={
+            <div>
+              <h1>Harlan</h1>
+              <p>No session selected</p>
+            </div>
+          }
+        >
+          {(current) => (
+            <div class="session-title">
+              <input
+                value={draftTitle()}
+                onInput={(event) => setDraftTitle(event.currentTarget.value)}
+                onBlur={() => void renameCurrentSession()}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.currentTarget.blur();
+                  }
+                }}
+                aria-label="Session title"
+              />
+              <p>{current().resourceId}</p>
+            </div>
+          )}
+        </Show>
+        <span class={`status status-${props.status}`}>{props.status}</span>
+      </div>
+
+      <div class="session-actions">
+        <button type="button" onClick={() => void renameCurrentSession()} disabled={!props.session}>
+          Rename
+        </button>
+        <button
+          class="secondary-button"
+          type="button"
+          onClick={() => void props.deleteSession()}
+          disabled={!props.session}
+        >
+          Delete
+        </button>
+      </div>
+    </header>
+  );
+}
+
+type EventLogProps = {
+  events: DomainLogItem[];
+};
+
+function EventLog(props: EventLogProps) {
+  return (
+    <section class="event-log-panel" aria-label="Event log">
+      <Show
+        when={props.events.length > 0}
+        fallback={<span class="empty-state">No events yet</span>}
+      >
+        <ol class="event-log">
+          <For each={props.events}>{(item) => <EventLogRow item={item} />}</For>
+        </ol>
+      </Show>
+    </section>
+  );
+}
+
+function EventLogRow(props: { item: DomainLogItem }) {
+  const title = createMemo(() => eventTitle(props.item.name));
+  const eventClass = createMemo(() => `event-row event-row-${props.item.name}`);
+
+  return (
+    <li class={eventClass()}>
+      <div class="event-row-header">
+        <span>{title()}</span>
+        <time>{new Date(props.item.createdAt).toLocaleString()}</time>
+      </div>
+      <EventLogContent item={props.item} />
+    </li>
+  );
+}
+
+function EventLogContent(props: { item: DomainLogItem }) {
+  const content = createMemo(() => {
+    switch (props.item.name) {
+      case domainEventNames.sessionStarted:
+        return {
+          element: "p",
+          className: "system-text",
+          text: props.item.data.session_path,
+        } as const;
+      case domainEventNames.userMessaged:
+        return {
+          element: "p",
+          className: "message-text",
+          text: props.item.data.user_message,
+        } as const;
+      case domainEventNames.agentResponded:
+        return {
+          element: "p",
+          className: "message-text",
+          text: props.item.data.agent_response,
+        } as const;
+      case domainEventNames.agentExecuted:
+        return {
+          element: "pre",
+          className: "code-output",
+          text: props.item.data.harlan_executed,
+        } as const;
+      case domainEventNames.executionCompleted:
+        return {
+          element: "pre",
+          className: "result-output",
+          text: props.item.data.result,
+        } as const;
+    }
+  });
+
+  return (
+    <Show when={content()} keyed>
+      {(currentContent) =>
+        currentContent.element === "pre" ? (
+          <pre class={currentContent.className}>{currentContent.text}</pre>
+        ) : (
+          <p class={currentContent.className}>{currentContent.text}</p>
+        )
+      }
+    </Show>
+  );
+}
+
+type PromptComposerProps = {
+  disabled: boolean;
+  running: boolean;
+  submitRun: (prompt: string) => Promise<void>;
+};
+
+function PromptComposer(props: PromptComposerProps) {
+  const [prompt, setPrompt] = createSignal("");
+
+  async function submitPrompt(event: SubmitEvent) {
+    event.preventDefault();
+
+    const trimmedPrompt = prompt().trim();
+
+    if (!trimmedPrompt || props.disabled) {
+      return;
+    }
+
+    await props.submitRun(trimmedPrompt);
+    setPrompt("");
+  }
+
+  return (
+    <form class="prompt-form" onSubmit={submitPrompt}>
+      <textarea
+        value={prompt()}
+        onInput={(event) => setPrompt(event.currentTarget.value)}
+        placeholder="Ask Harlan to inspect the repo, summarize files, or continue this session."
+        rows={8}
+      />
+      <button type="submit" disabled={!prompt().trim() || props.disabled}>
+        {props.running ? "Running" : "Run"}
+      </button>
+    </form>
   );
 }
 
 export default function App() {
   const [selectedSessionOverride, setSelectedSessionId] = createSignal("");
-  const [prompt, setPrompt] = createSignal("");
   const [submitting, setSubmitting] = createSignal(false);
   const [mutationError, setMutationError] = createSignal("");
-  let nextEventId = 1;
-  const nextTimelineEventId = () => nextEventId++;
 
-  const [sessionState] = createSignal<SessionsProjection>(async () => {
-    try {
-      const data = await readJson<{ sessions: SessionSummary[] }>(
-        await fetch(`${apiBaseUrl}/api/sessions`),
-      );
-      const loadedSessions =
-        data.sessions.length > 0 ? data.sessions : [await createSessionRequest()];
-
-      return {
-        items: loadedSessions,
-        error: "",
-      };
-    } catch (caught) {
-      return {
-        items: [],
-        error: caught instanceof Error ? caught.message : String(caught),
-      };
-    }
+  const [sessions] = createSignal<SessionSummary[]>(async () => {
+    const data = await readJson<{ sessions: SessionSummary[] }>(
+      await fetch(`${apiBaseUrl}/api/sessions`),
+    );
+    return data.sessions.length > 0 ? data.sessions : [await createSessionRequest()];
   });
 
-  const sessions = createMemo(() => sessionState().items);
-  const sessionsLoading = createMemo(() => isPending(() => sessionState()));
   const [selectedSessionId] = createSignal(
-    () => selectedSessionOverride() || sessions()[0]?.id || "",
+    () => selectedSessionOverride() || untrack(sessions)[0]?.id || "",
   );
-
-  const [detail] = createStore<SessionProjection>(
-    async (draft) => {
-      const sessionId = selectedSessionId();
-
-      if (!sessionId) {
-        replaceSessionProjection(draft, emptySessionProjection());
-        return;
-      }
-
-      const controller = new AbortController();
-      onCleanup(() => controller.abort());
-
-      try {
-        const response = await fetch(`${apiBaseUrl}/api/sessions/${sessionId}`, {
-          signal: controller.signal,
-        });
-
-        if (!response.ok || !response.body) {
-          const text = await response.text();
-          let message = text || `Request failed with ${response.status}`;
-
-          try {
-            const data = JSON.parse(text) as { error?: unknown };
-            message = typeof data.error === "string" ? data.error : message;
-          } catch {
-            // Keep the raw response text when the server did not return JSON.
-          }
-
-          replaceSessionProjection(draft, {
-            ...emptySessionProjection(),
-            streamError: message,
-          });
-          return;
-        }
-
-        replaceSessionProjection(draft, emptySessionProjection());
-
-        const parser = new SseEventParser();
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-
-        for (;;) {
-          const { value, done } = await reader.read();
-
-          if (done) {
-            break;
-          }
-
-          applySessionEvents(draft, parser.push(decoder.decode(value, { stream: true })));
-        }
-
-        applySessionEvents(draft, parser.push(decoder.decode()));
-        applySessionEvents(draft, parser.flush());
-      } catch (caught) {
-        if (controller.signal.aborted) {
-          return;
-        }
-
-        replaceSessionProjection(draft, {
-          ...emptySessionProjection(),
-          streamError: caught instanceof Error ? caught.message : String(caught),
-        });
-      }
-    },
-    emptySessionProjection(),
-  );
-
-  const runs = createMemo(() => detail.runs);
-  const events = createMemo(() => detail.events);
-  const session = createMemo(() => detail.session);
   const selectedSession = createMemo(() =>
     sessions().find((item) => item.id === selectedSessionId()),
   );
-  const runningRun = createMemo(() => runs().find((run) => run.status === "running"));
+
+  const [detail] = createStore<SessionProjection>(async function* (draft) {
+    const sessionId = selectedSessionId();
+
+    if (!sessionId) {
+      yield emptySessionProjection();
+      return;
+    }
+
+    const response = await fetch(`${apiBaseUrl}/api/sessions/${sessionId}`);
+    if (!response.ok || !response.body) {
+      const text = await response.text();
+      const data = text ? (JSON.parse(text) as { error?: string }) : {};
+      throw new Error(data.error ?? (text || `Request failed with ${response.status}`));
+    }
+
+    yield emptySessionProjection();
+
+    const parser = new SseEventParser();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      const decoded = parser.push(decoder.decode(value, { stream: true }));
+      yield applySessionEvents(draft, decoded);
+    }
+
+    yield applySessionEvents(draft, parser.push(decoder.decode()));
+    yield applySessionEvents(draft, parser.flush());
+  }, emptySessionProjection());
+
   const status = createMemo<RunStatus>(() => {
-    if (runningRun() || submitting()) {
+    if (submitting()) {
       return "running";
     }
 
-    return runs().at(-1)?.status ?? "idle";
+    return detail.session?.lastRunStatus ?? selectedSession()?.lastRunStatus ?? "idle";
   });
-  const error = createMemo(() => mutationError() || sessionState().error || detail.streamError);
-  const [draftTitle, setDraftTitle] = createSignal(() => session()?.title ?? "");
+  const error = createMemo(() => mutationError() || detail.streamError);
+  const promptDisabled = createMemo(() => !selectedSession() || status() === "running");
+  const running = createMemo(() => status() === "running");
 
   function applySessionEvents(draft: SessionProjection, parsedEvents: SseEvent[]) {
     for (const parsedEvent of parsedEvents) {
@@ -317,77 +427,57 @@ export default function App() {
         continue;
       }
 
-      draft.events = [
-        ...draft.events,
-        {
-          ...parsedEvent,
-          id: nextTimelineEventId(),
-        },
-      ];
-
-      if (
-        parsedEvent.event === "run-start" ||
-        parsedEvent.event === "done" ||
-        parsedEvent.event === "error" ||
-        parsedEvent.event === "session-updated"
-      ) {
-        refresh(sessionState);
-      }
-
-      if (parsedEvent.event === "session-snapshot") {
+      if (parsedEvent.event === "sessionSnapshot") {
         const payload = readEventPayload<SessionSnapshot>(parsedEvent);
-
-        if (payload) {
-          draft.session = payload.session;
-          draft.runs = payload.runs;
-          draft.messages = payload.messages;
-          draft.events = persistedTimelineEvents(payload.runs, nextTimelineEventId);
-          draft.streamError = "";
-        }
+        draft.session = payload.session;
+        draft.events = payload.events;
+        draft.streamError = "";
+        continue;
       }
 
-      if (parsedEvent.event === "session-updated") {
+      if (parsedEvent.event === "sessionUpdated") {
         const payload = readEventPayload<SessionUpdatedPayload>(parsedEvent);
-        draft.session = payload?.session ?? draft.session;
+        draft.session = payload.session;
+        refresh(sessions);
+        continue;
       }
 
-      if (parsedEvent.event === "session-deleted") {
-        replaceSessionProjection(draft, emptySessionProjection());
+      if (parsedEvent.event === "sessionDeleted") {
+        draft.session = null;
+        draft.events = [];
+        draft.streamError = "";
+        refresh(sessions);
+        continue;
       }
 
-      if (parsedEvent.event === "run-start") {
-        const payload = readEventPayload<RunEventPayload>(parsedEvent);
+      if (parsedEvent.event === "runError") {
+        const payload = readEventPayload<RunErrorPayload>(parsedEvent);
+        draft.streamError = payload.error ?? parsedEvent.data;
+        setSubmitting(false);
+        refresh(sessions);
+        continue;
+      }
 
-        if (payload?.run) {
-          draft.runs = upsertRun(draft.runs, payload.run);
+      if (parsedEvent.event === "runDone") {
+        setSubmitting(false);
+        refresh(sessions);
+        continue;
+      }
+
+      if (isDomainEventName(parsedEvent.event)) {
+        const domainEvent = readEventPayload<DomainLogItem>(parsedEvent);
+        draft.events = [...draft.events, domainEvent];
+
+        if (
+          domainEvent.name === domainEventNames.userMessaged ||
+          domainEvent.name === domainEventNames.agentResponded
+        ) {
+          refresh(sessions);
+        }
+
+        if (domainEvent.name === domainEventNames.agentResponded) {
           setSubmitting(false);
         }
-      }
-
-      if (parsedEvent.event === "text-delta") {
-        const payload = readEventPayload<RunEventPayload>(parsedEvent);
-        const text = readChunkText(parsedEvent);
-
-        if (payload && text) {
-          draft.runs = updateRun(draft.runs, payload.runId, (run) => ({
-            ...run,
-            answer: `${run.answer}${text}`,
-          }));
-        }
-      }
-
-      if (parsedEvent.event === "done" || parsedEvent.event === "error") {
-        const payload = readEventPayload<RunEventPayload>(parsedEvent);
-
-        if (payload?.run) {
-          draft.runs = upsertRun(draft.runs, payload.run);
-        }
-
-        if (parsedEvent.event === "error") {
-          draft.streamError = payload?.error ?? parsedEvent.data;
-        }
-
-        setSubmitting(false);
       }
     }
   }
@@ -395,7 +485,7 @@ export default function App() {
   async function createSession(title?: string) {
     const session = await createSessionRequest(title);
 
-    refresh(sessionState);
+    refresh(sessions);
     return session;
   }
 
@@ -420,17 +510,15 @@ export default function App() {
     setMutationError("");
   }
 
-  async function renameSession() {
-    const current = session();
-    const title = draftTitle().trim();
+  async function renameSession(title: string) {
+    const current = detail.session;
 
-    if (!current || !title || title === current.title) {
-      setDraftTitle(current?.title ?? "");
+    if (!current) {
       return;
     }
 
     try {
-      const data = await readJson<{ session: SessionDetail }>(
+      await readJson<{ session: SessionDetail }>(
         await fetch(`${apiBaseUrl}/api/sessions/${current.id}`, {
           method: "PATCH",
           headers: {
@@ -439,15 +527,14 @@ export default function App() {
           body: JSON.stringify({ title }),
         }),
       );
-      setDraftTitle(data.session.title);
-      refresh(sessionState);
+      refresh(sessions);
     } catch (caught) {
       setMutationError(caught instanceof Error ? caught.message : String(caught));
     }
   }
 
   async function deleteSession() {
-    const current = session();
+    const current = detail.session;
 
     if (!current || !confirm(`Delete "${current.title}"?`)) {
       return;
@@ -465,16 +552,13 @@ export default function App() {
         (await createSession("Untitled session"));
 
       setSelectedSessionId(nextSession.id);
-      refresh(sessionState);
+      refresh(sessions);
     } catch (caught) {
       setMutationError(caught instanceof Error ? caught.message : String(caught));
     }
   }
 
-  async function submitRun(event: SubmitEvent) {
-    event.preventDefault();
-
-    const trimmedPrompt = prompt().trim();
+  async function submitRun(trimmedPrompt: string) {
     const sessionId = selectedSessionId();
 
     if (!trimmedPrompt || !sessionId || status() === "running") {
@@ -497,9 +581,6 @@ export default function App() {
         const message = await response.text();
         throw new Error(message || `Request failed with ${response.status}`);
       }
-
-      setPrompt("");
-      refresh(sessionState);
     } catch (caught) {
       setSubmitting(false);
       setMutationError(caught instanceof Error ? caught.message : String(caught));
@@ -508,135 +589,30 @@ export default function App() {
 
   return (
     <main class="app-shell">
-      <aside class="session-pane" aria-label="Sessions">
-        <div class="session-header">
-          <h2>Sessions</h2>
-          <button class="icon-button" type="button" onClick={addSession} aria-label="New session">
-            +
-          </button>
-        </div>
+      <SessionSidebar
+        sessions={sessions()}
+        loading={isPending(sessions)}
+        selectedSessionId={selectedSessionId()}
+        addSession={() => void addSession()}
+        selectSession={(sessionId) => void selectSession(sessionId)}
+      />
 
-        <Show
-          when={!sessionsLoading()}
-          fallback={<span class="empty-state">Loading sessions</span>}
-        >
-          <ol class="session-list">
-            <For each={sessions()}>
-              {(item) => (
-                <li
-                  class={`session-item ${item.id === selectedSessionId() ? "session-item-active" : ""}`}
-                >
-                  <button type="button" onClick={() => void selectSession(item.id)}>
-                    <span>{item.title}</span>
-                    <time>{new Date(item.updatedAt).toLocaleString()}</time>
-                  </button>
-                </li>
-              )}
-            </For>
-          </ol>
-        </Show>
-      </aside>
+      <section class="workspace-pane">
+        <SessionHeader
+          session={detail.session}
+          status={status()}
+          renameSession={renameSession}
+          deleteSession={deleteSession}
+        />
 
-      <section class="run-pane">
-        <div class="toolbar">
-          <Show
-            when={session()}
-            fallback={
-              <div>
-                <h1>Harlan</h1>
-                <p>No session selected</p>
-              </div>
-            }
-          >
-            {(current) => (
-              <div class="session-title">
-                <input
-                  value={draftTitle()}
-                  onInput={(event) => setDraftTitle(event.currentTarget.value)}
-                  onBlur={() => void renameSession()}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.currentTarget.blur();
-                    }
-                  }}
-                  aria-label="Session title"
-                />
-                <p>{current().resourceId}</p>
-              </div>
-            )}
-          </Show>
-          <span class={`status status-${status()}`}>{status()}</span>
-        </div>
+        <EventLog events={detail.events} />
 
-        <div class="session-actions">
-          <button type="button" onClick={() => void renameSession()} disabled={!session()}>
-            Rename
-          </button>
-          <button
-            class="secondary-button"
-            type="button"
-            onClick={() => void deleteSession()}
-            disabled={!session()}
-          >
-            Delete
-          </button>
-        </div>
-
-        <section class="history-panel" aria-label="Session history">
-          <Show when={runs().length > 0} fallback={<span class="empty-state">No runs yet</span>}>
-            <ol class="run-list">
-              <For each={runs()}>
-                {(item) => (
-                  <li class="run-card">
-                    <div class="run-card-header">
-                      <span>{item.status}</span>
-                      <time>{new Date(item.startedAt).toLocaleString()}</time>
-                    </div>
-                    <p class="prompt-text">{item.prompt}</p>
-                    <Show when={item.error}>
-                      <pre class="error-output">{item.error}</pre>
-                    </Show>
-                    <pre>{item.answer || "No response captured"}</pre>
-                  </li>
-                )}
-              </For>
-            </ol>
-          </Show>
-        </section>
-
-        <form class="prompt-form" onSubmit={submitRun}>
-          <textarea
-            value={prompt()}
-            onInput={(event) => setPrompt(event.currentTarget.value)}
-            placeholder="Ask Harlan to inspect the repo, summarize files, or continue this session."
-            rows={8}
-          />
-          <button
-            type="submit"
-            disabled={!prompt().trim() || !selectedSession() || status() === "running"}
-          >
-            {status() === "running" ? "Running" : "Run"}
-          </button>
-        </form>
+        <PromptComposer disabled={promptDisabled()} running={running()} submitRun={submitRun} />
 
         <Show when={error()}>
           <pre class="error-output">{error()}</pre>
         </Show>
       </section>
-
-      <aside class="event-pane" aria-label="Stream events">
-        <h2>Events</h2>
-        <ol>
-          <For each={events()}>
-            {(item) => (
-              <li>
-                <span>{eventLabel(item)}</span>
-                <code>{item.data}</code>
-              </li>
-            )}
-          </For>
-        </ol>
-      </aside>
     </main>
   );
 }

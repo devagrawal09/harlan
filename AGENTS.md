@@ -26,3 +26,11 @@ You don't need createEffect to reactively set some signal, you can just pass in 
 Minimize the usage of effects and setters. Derive whatever you can.
 
 Use the built in helpers like isPending and Suspense, no need to manage loading state ourselves.
+
+Don't bother with try catch in the reactive graph and keeping track of error state manually. Just throw in the graph and let an `<Errored>` boundary handle it.
+
+Minimize defensive coding. Assume that things will be in the shape typescript expects unless they are coming from a network boundary, and in that case use zod schemas.
+
+Ports 43117 for the API and 3167 for the UI are fixed. If you try to run the dev server and those ports are occupied, that means the dev server is already running. Don't try to run it again, just find the existing process and kill it if you really need to restart the dev server.
+
+Component props don't need to be accessor functions. Just pass the value directly. Access reactively from the undestructured props object.

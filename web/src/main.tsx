@@ -1,4 +1,4 @@
-import { Loading, render } from "@solidjs/web";
+import { Errored, Loading, render } from "@solidjs/web";
 import App from "./App";
 import "./styles.css";
 
@@ -10,9 +10,11 @@ if (!root) {
 
 render(
   () => (
-    <Loading fallback={<main class="app-shell loading-shell">Loading Harlan</main>}>
-      <App />
-    </Loading>
+    <Errored fallback={(error) => <main class="app-shell loading-shell">{String(error())}</main>}>
+      <Loading fallback={<main class="app-shell loading-shell">Loading Harlan</main>}>
+        <App />
+      </Loading>
+    </Errored>
   ),
   root,
 );

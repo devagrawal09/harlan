@@ -223,16 +223,27 @@ test("session API creates, lists, renames, loads, and deletes sessions", async (
   const detail = await app.request(`/api/sessions/${createdBody.session.id}`);
   assert.equal(detail.status, 200);
   assert.match(detail.headers.get("content-type") ?? "", /text\/event-stream/);
-  const detailEvents = await readEventsUntil(detail, "session-snapshot");
+  const detailEvents = await readEventsUntil(detail, "sessionSnapshot");
   const detailBody = JSON.parse(detailEvents[0]?.data ?? "{}") as {
     session: { id: string; title: string };
     runs: unknown[];
     messages: unknown[];
+    events: unknown[];
   };
   assert.equal(detailBody.session.id, createdBody.session.id);
   assert.equal(detailBody.session.title, "Renamed session");
   assert.deepEqual(detailBody.runs, []);
   assert.deepEqual(detailBody.messages, []);
+  assert.deepEqual(detailBody.events, [
+    {
+      id: `${createdBody.session.id}:sessionStarted`,
+      name: "sessionStarted",
+      data: {
+        session_path: createdBody.session.id,
+      },
+      createdAt: createdBody.session.createdAt,
+    },
+  ]);
 
   const deleted = await app.request(`/api/sessions/${createdBody.session.id}`, {
     method: "DELETE",
@@ -300,21 +311,32 @@ test("GET /api/sessions/:sessionId streams initial snapshot", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
 
-  const events = await readEventsUntil(response, "session-snapshot");
+  const events = await readEventsUntil(response, "sessionSnapshot");
   assert.deepEqual(
     events.map((event) => event.event),
-    ["session-snapshot"],
+    ["sessionSnapshot"],
   );
 
   const snapshot = JSON.parse(events[0]?.data ?? "{}") as {
-    session: { id: string; title: string };
+    session: { id: string; title: string; createdAt: string };
     runs: unknown[];
     messages: unknown[];
+    events: unknown[];
   };
   assert.equal(snapshot.session.id, session.id);
   assert.equal(snapshot.session.title, "Stream session");
   assert.deepEqual(snapshot.runs, []);
   assert.deepEqual(snapshot.messages, []);
+  assert.deepEqual(snapshot.events, [
+    {
+      id: `${session.id}:sessionStarted`,
+      name: "sessionStarted",
+      data: {
+        session_path: session.id,
+      },
+      createdAt: snapshot.session.createdAt,
+    },
+  ]);
 });
 
 test("POST /api/sessions/:sessionId/runs returns 204 and publishes run events", async () => {
@@ -377,29 +399,34 @@ test("POST /api/sessions/:sessionId/runs returns 204 and publishes run events", 
 
   assert.equal(response.status, 204);
 
-  const events = await readEventsUntil(stream, "done");
+  const events = await readEventsUntil(stream, "agentResponded");
   assert.deepEqual(
     events.map((event) => event.event),
-    ["session-snapshot", "run-start", "session-updated", "text-delta", "done"],
+    ["sessionSnapshot", "userMessaged", "sessionUpdated", "agentResponded"],
   );
+  assert.ok(!events.some((event) => event.event === "text-delta"));
 
-  const runStart = JSON.parse(events[1]?.data ?? "{}") as {
-    runId: string;
-    sessionId: string;
-    model: string;
-    run: {
-      id: string;
-      prompt: string;
-      status: string;
+  const userMessaged = JSON.parse(events[1]?.data ?? "{}") as {
+    name: string;
+    data: {
+      session_path: string;
+      user_message: string;
     };
   };
-  assert.match(runStart.runId, /^[a-zA-Z0-9_-]+$/);
-  assert.equal(runStart.sessionId, sessionId);
-  assert.equal(runStart.model, "openrouter/google/gemini-2.0-flash-lite-001");
-  assert.equal(runStart.run.id, runStart.runId);
-  assert.equal(runStart.run.prompt, "Say hello");
-  assert.equal(runStart.run.status, "running");
-  assert.equal(JSON.parse(events[3]?.data ?? "{}").payload.text, "hello");
+  assert.equal(userMessaged.name, "userMessaged");
+  assert.equal(userMessaged.data.session_path, sessionId);
+  assert.equal(userMessaged.data.user_message, "Say hello");
+
+  const agentResponded = JSON.parse(events[3]?.data ?? "{}") as {
+    name: string;
+    data: {
+      session_path: string;
+      agent_response: string;
+    };
+  };
+  assert.equal(agentResponded.name, "agentResponded");
+  assert.equal(agentResponded.data.session_path, sessionId);
+  assert.equal(agentResponded.data.agent_response, "hello");
   assert.deepEqual(prompts, ["Say hello"]);
   assert.deepEqual(models, ["openrouter/google/gemini-2.0-flash-lite-001"]);
   assert.deepEqual(memoryCalls, [
@@ -410,7 +437,7 @@ test("POST /api/sessions/:sessionId/runs returns 204 and publishes run events", 
   ]);
 
   const detail = await app.request(`/api/sessions/${sessionId}`);
-  const detailEvents = await readEventsUntil(detail, "session-snapshot");
+  const detailEvents = await readEventsUntil(detail, "sessionSnapshot");
   const detailBody = JSON.parse(detailEvents[0]?.data ?? "{}") as {
     runs: Array<{
       id: string;
@@ -420,9 +447,9 @@ test("POST /api/sessions/:sessionId/runs returns 204 and publishes run events", 
       answer: string;
       events: Array<{ event: string; data: string; createdAt: string }>;
     }>;
+    events: Array<{ name: string; data: Record<string, string> }>;
   };
   assert.equal(detailBody.runs.length, 1);
-  assert.equal(detailBody.runs[0]?.id, runStart.runId);
   assert.equal(detailBody.runs[0]?.prompt, "Say hello");
   assert.equal(detailBody.runs[0]?.model, "openrouter/google/gemini-2.0-flash-lite-001");
   assert.equal(detailBody.runs[0]?.status, "done");
@@ -431,6 +458,124 @@ test("POST /api/sessions/:sessionId/runs returns 204 and publishes run events", 
     detailBody.runs[0]?.events.map((event) => event.event),
     ["run-start", "text-delta", "done"],
   );
+  assert.deepEqual(
+    detailBody.events.map((event) => event.name),
+    ["sessionStarted", "userMessaged", "agentResponded"],
+  );
+  assert.equal(detailBody.events[1]?.data.user_message, "Say hello");
+  assert.equal(detailBody.events[2]?.data.agent_response, "hello");
+});
+
+test("POST /api/sessions/:sessionId/runs publishes Harlan execution events", async () => {
+  const stateDir = await createTempStateDir();
+  const chunks = [
+    {
+      type: "tool-call",
+      payload: {
+        toolName: "execute_harlan",
+        args: {
+          code: "fs.cwd()",
+        },
+      },
+    } as unknown as AgentChunkType,
+    {
+      type: "tool-result",
+      payload: {
+        toolName: "execute_harlan",
+        result: "/tmp/project",
+      },
+    } as unknown as AgentChunkType,
+    {
+      type: "text-delta",
+      payload: {
+        text: "done",
+      },
+    } as AgentChunkType,
+  ];
+  const fakeAgent: ServerAgent = {
+    async stream() {
+      return {
+        fullStream: (async function* () {
+          yield* chunks;
+        })(),
+      };
+    },
+  };
+  const app = createServer({
+    stateDir,
+    createAgent() {
+      return fakeAgent;
+    },
+    env: {
+      OPENROUTER_API_KEY: "test-key",
+    },
+  });
+
+  const created = await app.request("/api/sessions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ title: "Tool session" }),
+  });
+  assert.equal(created.status, 201);
+  const sessionId = ((await created.json()) as { session: { id: string } }).session.id;
+
+  const stream = await app.request(`/api/sessions/${sessionId}`);
+  const response = await app.request(`/api/sessions/${sessionId}/runs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ prompt: "Run Harlan" }),
+  });
+  assert.equal(response.status, 204);
+
+  const events = await readEventsUntil(stream, "agentResponded");
+  assert.deepEqual(
+    events.map((event) => event.event),
+    [
+      "sessionSnapshot",
+      "userMessaged",
+      "sessionUpdated",
+      "agentExecuted",
+      "executionCompleted",
+      "agentResponded",
+    ],
+  );
+
+  const agentExecuted = JSON.parse(events[3]?.data ?? "{}") as {
+    data: {
+      harlan_executed: string;
+    };
+  };
+  const executionCompleted = JSON.parse(events[4]?.data ?? "{}") as {
+    data: {
+      result: string;
+    };
+  };
+
+  assert.equal(agentExecuted.data.harlan_executed, "fs.cwd()");
+  assert.equal(executionCompleted.data.result, "/tmp/project");
+
+  const detail = await app.request(`/api/sessions/${sessionId}`);
+  const detailEvents = await readEventsUntil(detail, "sessionSnapshot");
+  const snapshot = JSON.parse(detailEvents[0]?.data ?? "{}") as {
+    events: Array<{ name: string; data: Record<string, string> }>;
+  };
+
+  assert.deepEqual(
+    snapshot.events.map((event) => event.name),
+    [
+      "sessionStarted",
+      "userMessaged",
+      "agentExecuted",
+      "executionCompleted",
+      "agentResponded",
+    ],
+  );
+  assert.equal(snapshot.events[2]?.data.harlan_executed, "fs.cwd()");
+  assert.equal(snapshot.events[3]?.data.result, "/tmp/project");
 });
 
 test("PATCH /api/sessions/:sessionId publishes session-updated", async () => {
@@ -461,10 +606,10 @@ test("PATCH /api/sessions/:sessionId publishes session-updated", async () => {
   });
   assert.equal(renamed.status, 200);
 
-  const events = await readEventsUntil(stream, "session-updated");
+  const events = await readEventsUntil(stream, "sessionUpdated");
   assert.deepEqual(
     events.map((event) => event.event),
-    ["session-snapshot", "session-updated"],
+    ["sessionSnapshot", "sessionUpdated"],
   );
   assert.equal(JSON.parse(events[1]?.data ?? "{}").session.title, "After rename");
 });
@@ -505,15 +650,15 @@ test("agent errors publish error and persist failed run", async () => {
   });
   assert.equal(response.status, 204);
 
-  const events = await readEventsUntil(stream, "error");
+  const events = await readEventsUntil(stream, "runError");
   assert.deepEqual(
     events.map((event) => event.event),
-    ["session-snapshot", "run-start", "session-updated", "error"],
+    ["sessionSnapshot", "userMessaged", "sessionUpdated", "runError"],
   );
   assert.equal(JSON.parse(events[3]?.data ?? "{}").error, "agent failed");
 
   const detail = await app.request(`/api/sessions/${sessionId}`);
-  const detailEvents = await readEventsUntil(detail, "session-snapshot");
+  const detailEvents = await readEventsUntil(detail, "sessionSnapshot");
   const snapshot = JSON.parse(detailEvents[0]?.data ?? "{}") as {
     runs: Array<{
       status: string;

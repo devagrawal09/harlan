@@ -7,15 +7,22 @@ import type { Memory } from "@mastra/memory";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
+import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import z from "zod";
+import {
+  domainEventNames,
+  type DomainEventName,
+  type DomainEventPayloadMap,
+  type EventLogItem,
+} from "../events.ts";
 import {
   assertProviderConfig,
   createHarlanAgent,
   createHarlanMemory,
   defaultModel,
 } from "./agent.ts";
-import { HARLAN_RESOURCE_ID, SessionStore } from "./session-store.ts";
+import { HARLAN_RESOURCE_ID, SessionStore, type RunRecord } from "./session-store.ts";
 
 type AgentStream = {
   fullStream: AsyncIterable<AgentChunkType>;
@@ -98,12 +105,152 @@ const allowedOriginPatterns = [
   /^https:\/\/harlan\.localhost(?::\d+)?$/,
 ];
 
+type SessionSnapshotPayload = {
+  session: ReturnType<SessionStore["getSession"]>;
+  runs: RunRecord[];
+  messages: ReturnType<SessionStore["listMessages"]>;
+  events: EventLogItem[];
+};
+
+type ExecuteHarlanPayload = {
+  toolName?: string;
+  args?: {
+    code?: string;
+  };
+  input?: {
+    code?: string;
+  };
+  code?: string;
+  result?: string;
+  output?: string;
+  text?: string;
+  content?: string;
+};
+
+type PersistedAgentEvent = {
+  type: string;
+  payload?: ExecuteHarlanPayload;
+  chunk?: {
+    type?: string;
+    payload?: ExecuteHarlanPayload;
+  };
+};
+
 function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
 function resolveCorsOrigin(origin: string): string | undefined {
   return allowedOriginPatterns.some((pattern) => pattern.test(origin)) ? origin : undefined;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function createEventLogItem<Name extends DomainEventName>(
+  name: Name,
+  data: DomainEventPayloadMap[Name],
+  createdAt = nowIso(),
+  id: string = randomUUID(),
+): EventLogItem<Name> {
+  return {
+    id,
+    name,
+    data,
+    createdAt,
+  };
+}
+
+function parsePersistedRunEventData(event: RunRecord["events"][number]): unknown {
+  try {
+    return JSON.parse(event.data);
+  } catch {
+    return null;
+  }
+}
+
+function readExecuteHarlanPayload(event: PersistedAgentEvent): ExecuteHarlanPayload | null {
+  const payload = event.payload ?? event.chunk?.payload;
+  return payload?.toolName === "execute_harlan" ? payload : null;
+}
+
+function readExecuteHarlanCode(payload: ExecuteHarlanPayload): string | null {
+  return payload.args?.code ?? payload.input?.code ?? payload.code ?? null;
+}
+
+function readExecuteHarlanResult(payload: ExecuteHarlanPayload): string | null {
+  return payload.result ?? payload.output ?? payload.text ?? payload.content ?? null;
+}
+
+function projectRunToDomainEvents(run: RunRecord): EventLogItem[] {
+  const events: EventLogItem[] = [
+    createEventLogItem(
+      domainEventNames.userMessaged,
+      {
+        session_path: run.sessionId,
+        user_message: run.prompt,
+      },
+      run.startedAt,
+      `${run.id}:userMessaged`,
+    ),
+  ];
+
+  run.events.forEach((event, index) => {
+    const persisted = parsePersistedRunEventData(event) as PersistedAgentEvent | null;
+    const payload = persisted ? readExecuteHarlanPayload(persisted) : null;
+
+    if (!payload) {
+      return;
+    }
+
+    const code = readExecuteHarlanCode(payload);
+    const result = readExecuteHarlanResult(payload);
+
+    if (code) {
+      events.push(
+        createEventLogItem(
+          domainEventNames.agentExecuted,
+          {
+            session_path: run.sessionId,
+            harlan_executed: code,
+          },
+          event.createdAt,
+          `${run.id}:${index}:agentExecuted`,
+        ),
+      );
+    }
+
+    if (result && event.event !== "tool-call" && event.event !== "tool-call-delta") {
+      events.push(
+        createEventLogItem(
+          domainEventNames.executionCompleted,
+          {
+            session_path: run.sessionId,
+            result,
+          },
+          event.createdAt,
+          `${run.id}:${index}:executionCompleted`,
+        ),
+      );
+    }
+  });
+
+  if (run.answer) {
+    events.push(
+      createEventLogItem(
+        domainEventNames.agentResponded,
+        {
+          session_path: run.sessionId,
+          agent_response: run.answer,
+        },
+        run.completedAt ?? run.startedAt,
+        `${run.id}:agentResponded`,
+      ),
+    );
+  }
+
+  return events;
 }
 
 export function createServer(options: ServerOptions = {}): Hono {
@@ -188,7 +335,7 @@ export function createServer(options: ServerOptions = {}): Hono {
       });
 
       await enqueueMessage({
-        event: "session-snapshot",
+        event: "sessionSnapshot",
         data: getSessionSnapshot(sessionId),
       });
 
@@ -220,7 +367,7 @@ export function createServer(options: ServerOptions = {}): Hono {
       return c.json({ error: "Session not found." }, 404);
     }
 
-    sessionEvents.publish(sessionId, "session-updated", { session });
+    sessionEvents.publish(sessionId, "sessionUpdated", { session });
 
     return c.json({ session });
   });
@@ -236,7 +383,7 @@ export function createServer(options: ServerOptions = {}): Hono {
       return c.json({ error: "Cannot delete a session with a running run." }, 409);
     }
 
-    sessionEvents.publish(sessionId, "session-deleted", { sessionId });
+    sessionEvents.publish(sessionId, "sessionDeleted", { sessionId });
     sessionStore.deleteSession(sessionId);
     await memory?.deleteThread(sessionId);
 
@@ -285,14 +432,19 @@ export function createServer(options: ServerOptions = {}): Hono {
 
     const agent = createAgent(model);
     const run = sessionStore.createRun(sessionId, prompt, model);
+    const userMessaged = createEventLogItem(domainEventNames.userMessaged, {
+      session_path: sessionId,
+      user_message: prompt,
+    });
 
-    writeRunEvent(run.id, "run-start", {
+    persistRunEvent(run.id, "run-start", {
       runId: run.id,
       sessionId,
       model,
       run,
     });
-    sessionEvents.publish(sessionId, "session-updated", {
+    publishDomainEvent(userMessaged);
+    sessionEvents.publish(sessionId, "sessionUpdated", {
       session: sessionStore.getSession(sessionId),
     });
     void runAgent({ agent, prompt, runId: run.id, sessionId });
@@ -300,22 +452,38 @@ export function createServer(options: ServerOptions = {}): Hono {
     return c.body(null, 204);
   }
 
-  function getSessionSnapshot(sessionId: string) {
+  function getSessionSnapshot(sessionId: string): SessionSnapshotPayload {
+    const session = sessionStore.getSession(sessionId);
+    const runs = sessionStore.listRuns(sessionId);
+    const events = session
+      ? [
+          createEventLogItem(
+            domainEventNames.sessionStarted,
+            {
+              session_path: session.id,
+            },
+            session.createdAt,
+            `${session.id}:sessionStarted`,
+          ),
+          ...runs.flatMap(projectRunToDomainEvents),
+        ]
+      : [];
+
     return {
-      session: sessionStore.getSession(sessionId),
-      runs: sessionStore.listRuns(sessionId),
+      session,
+      runs,
       messages: sessionStore.listMessages(sessionId),
+      events,
     };
   }
 
-  function writeRunEvent(runId: string, event: string, data: unknown): void {
+  function persistRunEvent(runId: string, event: string, data: unknown): void {
     const serialized = JSON.stringify(data);
     sessionStore.appendRunEvent(runId, event, serialized);
-    const run = sessionStore.getRun(runId);
+  }
 
-    if (run) {
-      sessionEvents.publish(run.sessionId, event, data);
-    }
+  function publishDomainEvent(event: EventLogItem): void {
+    sessionEvents.publish(event.data.session_path, event.name, event);
   }
 
   async function runAgent({
@@ -336,6 +504,7 @@ export function createServer(options: ServerOptions = {}): Hono {
           thread: sessionId,
         },
       });
+      let agentResponse = "";
 
       for await (const chunk of output.fullStream) {
         const eventData = {
@@ -351,10 +520,36 @@ export function createServer(options: ServerOptions = {}): Hono {
 
           if (typeof text === "string") {
             sessionStore.appendRunAnswer(runId, text);
+            agentResponse += text;
           }
         }
 
-        writeRunEvent(runId, chunk.type, eventData);
+        persistRunEvent(runId, chunk.type, eventData);
+
+        const executeHarlanPayload = readExecuteHarlanPayload(eventData as PersistedAgentEvent);
+
+        if (executeHarlanPayload) {
+          const code = readExecuteHarlanCode(executeHarlanPayload);
+          const result = readExecuteHarlanResult(executeHarlanPayload);
+
+          if (code) {
+            publishDomainEvent(
+              createEventLogItem(domainEventNames.agentExecuted, {
+                session_path: sessionId,
+                harlan_executed: code,
+              }),
+            );
+          }
+
+          if (result && chunk.type !== "tool-call" && chunk.type !== "tool-call-delta") {
+            publishDomainEvent(
+              createEventLogItem(domainEventNames.executionCompleted, {
+                session_path: sessionId,
+                result,
+              }),
+            );
+          }
+        }
       }
 
       if (output.error) {
@@ -363,16 +558,24 @@ export function createServer(options: ServerOptions = {}): Hono {
 
       sessionStore.completeRun(runId);
       const run = sessionStore.getRun(runId);
-      writeRunEvent(runId, "done", { ok: true, runId, sessionId, run });
-      sessionEvents.publish(sessionId, "session-updated", {
+      persistRunEvent(runId, "done", { ok: true, runId, sessionId, run });
+      publishDomainEvent(
+        createEventLogItem(domainEventNames.agentResponded, {
+          session_path: sessionId,
+          agent_response: run?.answer ?? agentResponse,
+        }),
+      );
+      sessionEvents.publish(sessionId, "runDone", { ok: true, runId, sessionId, run });
+      sessionEvents.publish(sessionId, "sessionUpdated", {
         session: sessionStore.getSession(sessionId),
       });
     } catch (error) {
       const message = toErrorMessage(error);
       sessionStore.failRun(runId, message);
       const run = sessionStore.getRun(runId);
-      writeRunEvent(runId, "error", { error: message, runId, sessionId, run });
-      sessionEvents.publish(sessionId, "session-updated", {
+      persistRunEvent(runId, "error", { error: message, runId, sessionId, run });
+      sessionEvents.publish(sessionId, "runError", { error: message, runId, sessionId, run });
+      sessionEvents.publish(sessionId, "sessionUpdated", {
         session: sessionStore.getSession(sessionId),
       });
     }
