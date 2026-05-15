@@ -13,6 +13,7 @@ pnpm-debug.log*
 .env
 .env.*
 !.env.example
+.harlan/
 
 .DS_Store
 Thumbs.db

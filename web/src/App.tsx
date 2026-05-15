@@ -1,4 +1,4 @@
-import { createMemo, createProjection, createSignal, createStore, refresh } from "solid-js";
+import { createMemo, createSignal, isPending, refresh } from "solid-js";
 import { For, Show } from "@solidjs/web";
 import { SseEventParser, type SseEvent } from "./events";
 
@@ -39,6 +39,12 @@ type SessionProjection = {
   session: SessionDetail | null;
   runs: RunRecord[];
   messages: unknown[];
+  error: string;
+};
+
+type SessionsProjection = {
+  items: SessionSummary[];
+  error: string;
 };
 
 type TimelineEvent = SseEvent & {
@@ -89,41 +95,58 @@ async function readJson<T>(response: Response): Promise<T> {
   return data as T;
 }
 
+async function createSessionRequest(title?: string): Promise<SessionDetail> {
+  const data = await readJson<{ session: SessionDetail }>(
+    await fetch(`${apiBaseUrl}/api/sessions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ title }),
+    }),
+  );
+
+  return data.session;
+}
+
 export default function App() {
   const [selectedSessionOverride, setSelectedSessionId] = createSignal("");
-  const [loading, setLoading] = createSignal(true);
   const [prompt, setPrompt] = createSignal("");
   const [status, setStatus] = createSignal<RunStatus>("idle");
   const [answer, setAnswer] = createSignal("");
   const [events, setEvents] = createSignal<TimelineEvent[]>([]);
-  const [error, setError] = createSignal("");
+  const [mutationError, setMutationError] = createSignal("");
   let nextEventId = 1;
 
-  const [sessions] = createStore<SessionSummary[]>(
+  const [sessionState] = createSignal<SessionsProjection>(
     async () => {
-      setLoading(true);
-
       try {
         const data = await readJson<{ sessions: SessionSummary[] }>(
           await fetch(`${apiBaseUrl}/api/sessions`),
         );
-        setError("");
-        return data.sessions;
+        const loadedSessions =
+          data.sessions.length > 0 ? data.sessions : [await createSessionRequest()];
+
+        return {
+          items: loadedSessions,
+          error: "",
+        };
       } catch (caught) {
-        setError(caught instanceof Error ? caught.message : String(caught));
-        return [];
-      } finally {
-        setLoading(false);
+        return {
+          items: [],
+          error: caught instanceof Error ? caught.message : String(caught),
+        };
       }
     },
-    [],
   );
 
+  const sessions = createMemo(() => sessionState().items);
+  const sessionsLoading = createMemo(() => isPending(() => sessionState()));
   const [selectedSessionId] = createSignal(
-    () => selectedSessionOverride() || sessions[0]?.id || "",
+    () => selectedSessionOverride() || sessions()[0]?.id || "",
   );
 
-  const detail = createProjection<SessionProjection>(
+  const [detail] = createSignal<SessionProjection>(
     async () => {
       const sessionId = selectedSessionId();
 
@@ -132,57 +155,51 @@ export default function App() {
           session: null,
           runs: [],
           messages: [],
+          error: "",
         };
       }
 
       try {
-        return await readJson<SessionProjection>(
+        const data = await readJson<Omit<SessionProjection, "error">>(
           await fetch(`${apiBaseUrl}/api/sessions/${sessionId}`),
         );
+
+        return {
+          ...data,
+          error: "",
+        };
       } catch (caught) {
-        setError(caught instanceof Error ? caught.message : String(caught));
         return {
           session: null,
           runs: [],
           messages: [],
+          error: caught instanceof Error ? caught.message : String(caught),
         };
       }
     },
-    {
-      session: null,
-      runs: [],
-      messages: [],
-    },
   );
 
-  const runs = createProjection<RunRecord[]>(() => detail.runs, []);
-  const session = createMemo(() => detail.session);
-  const selectedSession = createMemo(() => sessions.find((item) => item.id === selectedSessionId()));
+  const runs = createMemo(() => detail().runs);
+  const session = createMemo(() => detail().session);
+  const selectedSession = createMemo(() => sessions().find((item) => item.id === selectedSessionId()));
+  const error = createMemo(() => mutationError() || sessionState().error || detail().error);
   const [draftTitle, setDraftTitle] = createSignal(() => session()?.title ?? "");
 
   async function createSession(title?: string) {
-    const data = await readJson<{ session: SessionDetail }>(
-      await fetch(`${apiBaseUrl}/api/sessions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ title }),
-      }),
-    );
+    const session = await createSessionRequest(title);
 
-    refresh(sessions);
-    return data.session;
+    refresh(sessionState);
+    return session;
   }
 
   async function addSession() {
-    setError("");
+    setMutationError("");
 
     try {
       const created = await createSession("Untitled session");
       await selectSession(created.id);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setMutationError(caught instanceof Error ? caught.message : String(caught));
     }
   }
 
@@ -195,7 +212,7 @@ export default function App() {
     setStatus("idle");
     setAnswer("");
     setEvents([]);
-    setError("");
+    setMutationError("");
   }
 
   async function renameSession() {
@@ -218,10 +235,10 @@ export default function App() {
         }),
       );
       setDraftTitle(data.session.title);
-      refresh(sessions);
+      refresh(sessionState);
       refresh(detail);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setMutationError(caught instanceof Error ? caught.message : String(caught));
     }
   }
 
@@ -239,12 +256,13 @@ export default function App() {
         }),
       );
 
-      const nextSession = sessions.find((item) => item.id !== current.id);
-      setSelectedSessionId(nextSession?.id ?? "");
-      refresh(sessions);
-      refresh(detail);
+      const nextSession =
+        sessions().find((item) => item.id !== current.id) ?? (await createSession("Untitled session"));
+
+      setSelectedSessionId(nextSession.id);
+      refresh(sessionState);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setMutationError(caught instanceof Error ? caught.message : String(caught));
     }
   }
 
@@ -261,7 +279,7 @@ export default function App() {
     setStatus("running");
     setAnswer("");
     setEvents([]);
-    setError("");
+    setMutationError("");
 
     try {
       const response = await fetch(`${apiBaseUrl}/api/sessions/${sessionId}/runs`, {
@@ -298,10 +316,10 @@ export default function App() {
       setStatus((current) => (current === "running" ? "done" : current));
       setPrompt("");
       refresh(detail);
-      refresh(sessions);
+      refresh(sessionState);
     } catch (caught) {
       setStatus("error");
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setMutationError(caught instanceof Error ? caught.message : String(caught));
     }
   }
 
@@ -327,7 +345,7 @@ export default function App() {
 
       if (parsedEvent.event === "error") {
         setStatus("error");
-        setError(parsedEvent.data);
+        setMutationError(parsedEvent.data);
       }
 
       if (parsedEvent.event === "done") {
@@ -346,9 +364,9 @@ export default function App() {
           </button>
         </div>
 
-        <Show when={!loading()} fallback={<span class="empty-state">Loading sessions</span>}>
+        <Show when={!sessionsLoading()} fallback={<span class="empty-state">Loading sessions</span>}>
           <ol class="session-list">
-            <For each={sessions}>
+            <For each={sessions()}>
               {(item) => (
                 <li class={`session-item ${item.id === selectedSessionId() ? "session-item-active" : ""}`}>
                   <button type="button" onClick={() => void selectSession(item.id)}>
@@ -403,9 +421,9 @@ export default function App() {
         </div>
 
         <section class="history-panel" aria-label="Session history">
-          <Show when={runs.length > 0 || answer()} fallback={<span class="empty-state">No runs yet</span>}>
+          <Show when={runs().length > 0 || answer()} fallback={<span class="empty-state">No runs yet</span>}>
             <ol class="run-list">
-              <For each={runs}>
+              <For each={runs()}>
                 {(item) => (
                   <li class="run-card">
                     <div class="run-card-header">

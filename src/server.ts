@@ -3,30 +3,56 @@
 import "dotenv/config";
 import { serve } from "@hono/node-server";
 import type { AgentChunkType } from "@mastra/core/stream";
-import { Hono } from "hono";
+import type { Memory } from "@mastra/memory";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { pathToFileURL } from "node:url";
 import z from "zod";
-import { assertProviderConfig, createHarlanAgent, defaultModel } from "./agent.ts";
+import {
+  assertProviderConfig,
+  createHarlanAgent,
+  createHarlanMemory,
+  defaultModel,
+} from "./agent.ts";
+import { HARLAN_RESOURCE_ID, SessionStore } from "./session-store.ts";
 
 type AgentStream = {
   fullStream: AsyncIterable<AgentChunkType>;
   error?: unknown;
 };
 
+type AgentStreamOptions = {
+  memory?: {
+    resource: string;
+    thread: string;
+  };
+};
+
 export type ServerAgent = {
-  stream(prompt: string): Promise<AgentStream>;
+  stream(prompt: string, options?: AgentStreamOptions): Promise<AgentStream>;
 };
 
 export type ServerOptions = {
   createAgent?: (model: string) => ServerAgent;
   env?: NodeJS.ProcessEnv;
+  memory?: Memory;
+  sessionStore?: SessionStore;
+  stateDir?: string;
 };
 
 const runRequestSchema = z.object({
   prompt: z.string().trim().min(1),
   model: z.string().trim().min(1).optional(),
+  sessionId: z.string().trim().min(1).optional(),
+});
+
+const createSessionSchema = z.object({
+  title: z.string().optional(),
+});
+
+const renameSessionSchema = z.object({
+  title: z.string().trim().min(1),
 });
 
 const allowedOriginPatterns = [
@@ -44,7 +70,11 @@ function resolveCorsOrigin(origin: string): string | undefined {
 }
 
 export function createServer(options: ServerOptions = {}): Hono {
-  const createAgent = options.createAgent ?? createHarlanAgent;
+  const sessionStore = options.sessionStore ?? new SessionStore({ stateDir: options.stateDir });
+  const memory =
+    options.memory ?? (options.createAgent ? undefined : createHarlanMemory(sessionStore.stateDir));
+  const createAgent =
+    options.createAgent ?? ((model: string) => createHarlanAgent(model, { memory }) as ServerAgent);
   const env = options.env ?? process.env;
   const app = new Hono();
 
@@ -53,7 +83,7 @@ export function createServer(options: ServerOptions = {}): Hono {
     cors({
       origin: resolveCorsOrigin,
       allowHeaders: ["Content-Type"],
-      allowMethods: ["GET", "POST", "OPTIONS"],
+      allowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     }),
   );
 
@@ -63,7 +93,95 @@ export function createServer(options: ServerOptions = {}): Hono {
     }),
   );
 
+  app.get("/api/sessions", (c) => {
+    return c.json({ sessions: sessionStore.listSessions() });
+  });
+
+  app.post("/api/sessions", async (c) => {
+    let body: unknown;
+
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "Request body must be valid JSON." }, 400);
+    }
+
+    const parsed = createSessionSchema.safeParse(body);
+
+    if (!parsed.success) {
+      return c.json({ error: "Request body must include an optional title." }, 400);
+    }
+
+    return c.json({ session: sessionStore.createSession(parsed.data.title) }, 201);
+  });
+
+  app.get("/api/sessions/:sessionId", (c) => {
+    const sessionId = c.req.param("sessionId");
+    const session = sessionStore.getSession(sessionId);
+
+    if (!session) {
+      return c.json({ error: "Session not found." }, 404);
+    }
+
+    return c.json({
+      session,
+      runs: sessionStore.listRuns(sessionId),
+      messages: sessionStore.listMessages(sessionId),
+    });
+  });
+
+  app.patch("/api/sessions/:sessionId", async (c) => {
+    const sessionId = c.req.param("sessionId");
+    let body: unknown;
+
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "Request body must be valid JSON." }, 400);
+    }
+
+    const parsed = renameSessionSchema.safeParse(body);
+
+    if (!parsed.success) {
+      return c.json({ error: "Request body must include a non-empty title." }, 400);
+    }
+
+    const session = sessionStore.updateSessionTitle(sessionId, parsed.data.title);
+
+    if (!session) {
+      return c.json({ error: "Session not found." }, 404);
+    }
+
+    return c.json({ session });
+  });
+
+  app.delete("/api/sessions/:sessionId", async (c) => {
+    const sessionId = c.req.param("sessionId");
+
+    if (!sessionStore.getSession(sessionId)) {
+      return c.json({ error: "Session not found." }, 404);
+    }
+
+    if (sessionStore.hasRunningRun(sessionId)) {
+      return c.json({ error: "Cannot delete a session with a running run." }, 409);
+    }
+
+    sessionStore.deleteSession(sessionId);
+    await memory?.deleteThread(sessionId);
+
+    return c.json({ ok: true });
+  });
+
+  app.post("/api/sessions/:sessionId/runs", async (c) => {
+    const sessionId = c.req.param("sessionId");
+    return handleRunRequest(c, sessionId);
+  });
+
   app.post("/api/runs", async (c) => {
+    return handleRunRequest(c);
+  });
+
+  async function handleRunRequest(c: Context, routeSessionId?: string) {
     let body: unknown;
 
     try {
@@ -79,6 +197,13 @@ export function createServer(options: ServerOptions = {}): Hono {
     }
 
     const { prompt } = parsed.data;
+    const sessionId = routeSessionId ?? parsed.data.sessionId ?? sessionStore.createSession().id;
+    const session = sessionStore.getSession(sessionId);
+
+    if (!session) {
+      return c.json({ error: "Session not found." }, 404);
+    }
+
     const model = parsed.data.model ?? defaultModel;
 
     try {
@@ -88,39 +213,54 @@ export function createServer(options: ServerOptions = {}): Hono {
     }
 
     const agent = createAgent(model);
+    const run = sessionStore.createRun(sessionId, prompt, model);
 
     return streamSSE(c, async (stream) => {
-      await stream.writeSSE({
-        event: "run-start",
-        data: JSON.stringify({ model }),
+      async function writeEvent(event: string, data: unknown) {
+        const serialized = JSON.stringify(data);
+        sessionStore.appendRunEvent(run.id, event, serialized);
+        await stream.writeSSE({ event, data: serialized });
+      }
+
+      await writeEvent("run-start", {
+        runId: run.id,
+        sessionId,
+        model,
       });
 
       try {
-        const output = await agent.stream(prompt);
+        const output = await agent.stream(prompt, {
+          memory: {
+            resource: HARLAN_RESOURCE_ID,
+            thread: sessionId,
+          },
+        });
 
         for await (const chunk of output.fullStream) {
-          await stream.writeSSE({
-            event: chunk.type,
-            data: JSON.stringify(chunk),
-          });
+          if (chunk.type === "text-delta") {
+            const text = (chunk as { payload?: { text?: unknown } }).payload?.text;
+
+            if (typeof text === "string") {
+              sessionStore.appendRunAnswer(run.id, text);
+            }
+          }
+
+          await writeEvent(chunk.type, chunk);
         }
 
         if (output.error) {
           throw output.error;
         }
 
-        await stream.writeSSE({
-          event: "done",
-          data: JSON.stringify({ ok: true }),
-        });
+        sessionStore.completeRun(run.id);
+        await writeEvent("done", { ok: true, runId: run.id, sessionId });
       } catch (error) {
-        await stream.writeSSE({
-          event: "error",
-          data: JSON.stringify({ error: toErrorMessage(error) }),
-        });
+        const message = toErrorMessage(error);
+        sessionStore.failRun(run.id, message);
+        await writeEvent("error", { error: message, runId: run.id, sessionId });
       }
     });
-  });
+  }
 
   return app;
 }

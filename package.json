@@ -12,6 +12,7 @@
     "dev": "concurrently -k -n server,web \"npm run dev:server\" \"npm run dev:web\"",
     "dev:server": "PORT=43117 HOST=127.0.0.1 node --watch ./src/server.ts",
     "dev:web": "vite --config web/vite.config.ts --port 3167 --strictPort --host 127.0.0.1",
+    "eval": "VITEST_LIVE_EVAL=1 vitest run",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",

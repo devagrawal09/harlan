@@ -24,3 +24,5 @@ Async logic no longer needs `createEffect`. We can put async logic directly into
 You don't need createEffect to reactively set some signal, you can just pass in a reactive function into createSignal/createStore to derive them from other sources.
 
 Minimize the usage of effects and setters. Derive whatever you can.
+
+Use the built in helpers like isPending and Suspense, no need to manage loading state ourselves.

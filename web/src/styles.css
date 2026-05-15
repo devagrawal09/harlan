@@ -35,6 +35,12 @@ textarea {
   min-height: 100vh;
 }
 
+.loading-shell {
+  display: grid;
+  place-items: center;
+  color: #66706a;
+}
+
 .session-pane {
   display: flex;
   flex-direction: column;
