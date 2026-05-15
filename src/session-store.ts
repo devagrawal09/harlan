@@ -121,7 +121,9 @@ export class SessionStore {
     const result = persistedStateSchema.safeParse(parsed);
 
     if (!result.success) {
-      throw new Error(`Invalid Harlan state in ${this.statePath}: ${z.prettifyError(result.error)}`);
+      throw new Error(
+        `Invalid Harlan state in ${this.statePath}: ${z.prettifyError(result.error)}`,
+      );
     }
 
     return result.data;

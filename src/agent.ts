@@ -1,12 +1,7 @@
 import { Agent } from "@mastra/core/agent";
-import type { MastraMemory } from "@mastra/core/memory";
 import { createTool } from "@mastra/core/tools";
-import { LibSQLStore } from "@mastra/libsql";
-import { Memory } from "@mastra/memory";
-import { join } from "node:path";
 import z from "zod";
 import { formatUnknownError, renderHarlanResult, runHarlan } from "./harlan/index.ts";
-import { resolveStateDir } from "./session-store.ts";
 
 export const defaultModel =
   process.env.HARLAN_MODEL ?? "openrouter/google/gemini-2.0-flash-lite-001";
@@ -30,23 +25,7 @@ export const execute_harlan = createTool({
   },
 });
 
-export type HarlanAgentOptions = {
-  memory?: MastraMemory;
-};
-
-export function createHarlanMemory(stateDir = resolveStateDir()): Memory {
-  return new Memory({
-    storage: new LibSQLStore({
-      id: "harlan-memory",
-      url: `file:${join(stateDir, "mastra.db")}`,
-    }),
-    options: {
-      lastMessages: 20,
-    },
-  });
-}
-
-export function createHarlanAgent(model: string, options: HarlanAgentOptions = {}): Agent {
+export function createHarlanAgent(model: string): Agent {
   return new Agent({
     id: "harlan-agent",
     name: "Harlan Agent",
@@ -92,7 +71,6 @@ fs.glob("src/**/*.ts")
   |> format.lines()`,
     ],
     model,
-    memory: options.memory,
     tools: { execute_harlan },
   });
 }

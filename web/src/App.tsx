@@ -1,11 +1,4 @@
-import {
-  createMemo,
-  createSignal,
-  createStore,
-  isPending,
-  refresh,
-  untrack,
-} from "solid-js";
+import { createMemo, createSignal, createStore, isPending, refresh, untrack } from "solid-js";
 import { For, Show } from "@solidjs/web";
 import {
   domainEventNames,
@@ -53,6 +46,53 @@ type RunErrorPayload = {
 type DomainLogItem = {
   [Name in DomainEventName]: EventLogItem<Name>;
 }[DomainEventName];
+
+const appShellClass =
+  "grid min-h-screen grid-cols-1 bg-[#f6f7f4] font-sans text-[#18201f] [font-synthesis:none] [text-rendering:optimizeLegibility] min-[761px]:grid-cols-[260px_minmax(0,1fr)]";
+const primaryButtonClass =
+  "w-fit min-w-24 cursor-pointer rounded-lg border-0 bg-[#18201f] px-[18px] py-2.5 text-white disabled:cursor-not-allowed disabled:bg-[#dbe0dc] disabled:text-[#66706a]";
+const secondaryButtonClass = `${primaryButtonClass} border border-[#cbd2ca] bg-white text-[#22302c]`;
+const emptyStateClass = "text-[#7a837d]";
+const listClass = "grid list-none gap-2.5 p-0";
+const messageTextClass =
+  "whitespace-pre-wrap break-words leading-[1.55] text-[#22302c] [overflow-wrap:anywhere]";
+const systemTextClass =
+  "whitespace-pre-wrap break-words text-[13px] leading-[1.55] text-[#66706a] [overflow-wrap:anywhere]";
+const codeOutputClass =
+  "m-0 max-w-full overflow-auto whitespace-pre-wrap break-words rounded-lg border border-[#e0ded6] bg-[#fbfaf6] p-3 font-mono text-[13px] leading-[1.55] text-[#22302c] [overflow-wrap:anywhere]";
+const errorOutputClass =
+  "m-0 whitespace-pre-wrap break-words rounded-lg border border-[#cbd2ca] bg-white p-3.5 font-mono text-[13px] leading-[1.55] text-[#8c2f2f] [overflow-wrap:anywhere]";
+
+function statusClass(status: RunStatus) {
+  const statusColorClass =
+    status === "running"
+      ? "border-[#2f6f7e] text-[#1c5967]"
+      : status === "done"
+        ? "border-[#3c7a52] text-[#28613d]"
+        : status === "error"
+          ? "border-[#a44a4a] text-[#8c2f2f]"
+          : "border-[#cbd2ca] text-[#4f5a55]";
+
+  return `min-w-[88px] rounded-full border px-3 py-1.5 text-center capitalize ${statusColorClass}`;
+}
+
+function eventRowClass(name: DomainEventName) {
+  const baseClass = "grid min-w-0 gap-2.5 rounded-lg border bg-white p-3.5";
+
+  if (name === domainEventNames.sessionStarted) {
+    return `${baseClass} bg-[#f7f8f6] px-3 py-2.5`;
+  }
+
+  if (name === domainEventNames.userMessaged) {
+    return `${baseClass} border-[#c9d8df] bg-[#fbfdfe]`;
+  }
+
+  if (name === domainEventNames.agentExecuted || name === domainEventNames.executionCompleted) {
+    return `${baseClass} border-[#d7d1c3] bg-[#fffdf8]`;
+  }
+
+  return `${baseClass} border-[#cdd9cf]`;
+}
 
 const apiBaseUrl = (
   import.meta.env.VITE_HARLAN_API_URL ||
@@ -131,11 +171,14 @@ type SessionSidebarProps = {
 
 function SessionSidebar(props: SessionSidebarProps) {
   return (
-    <aside class="session-pane" aria-label="Sessions">
-      <div class="session-header">
-        <h2>Sessions</h2>
+    <aside
+      class="flex flex-col gap-3.5 border-b border-[#d9ded9] bg-white px-3.5 py-5 min-[761px]:border-r min-[761px]:border-b-0"
+      aria-label="Sessions"
+    >
+      <div class="flex items-center justify-between gap-3">
+        <h2 class="text-sm font-bold uppercase">Sessions</h2>
         <button
-          class="icon-button"
+          class={`${primaryButtonClass} inline-grid size-[34px] min-w-[34px] place-items-center p-0 text-xl`}
           type="button"
           onClick={props.addSession}
           aria-label="New session"
@@ -144,17 +187,31 @@ function SessionSidebar(props: SessionSidebarProps) {
         </button>
       </div>
 
-      <Show when={!props.loading} fallback={<span class="empty-state">Loading sessions</span>}>
-        <ol class="session-list">
+      <Show when={!props.loading} fallback={<span class={emptyStateClass}>Loading sessions</span>}>
+        <ol class={listClass}>
           <For each={props.sessions}>
             {(item) => {
               const active = createMemo(() => item.id === props.selectedSessionId);
+              const itemButtonClass = createMemo(
+                () =>
+                  `grid w-full min-w-0 gap-[5px] rounded-lg border p-2.5 text-left text-[#22302c] hover:border-[#cbd2ca] hover:bg-[#eef2ef] ${
+                    active() ? "border-[#cbd2ca] bg-[#eef2ef]" : "border-transparent bg-transparent"
+                  }`,
+              );
 
               return (
-                <li class={`session-item ${active() ? "session-item-active" : ""}`}>
-                  <button type="button" onClick={() => props.selectSession(item.id)}>
-                    <span>{item.title}</span>
-                    <time>{new Date(item.updatedAt).toLocaleString()}</time>
+                <li>
+                  <button
+                    class={itemButtonClass()}
+                    type="button"
+                    onClick={() => props.selectSession(item.id)}
+                  >
+                    <span class="overflow-hidden text-ellipsis whitespace-nowrap text-sm font-bold text-[#22302c]">
+                      {item.title}
+                    </span>
+                    <time class="text-xs text-[#66706a]">
+                      {new Date(item.updatedAt).toLocaleString()}
+                    </time>
                   </button>
                 </li>
               );
@@ -189,20 +246,21 @@ function SessionHeader(props: SessionHeaderProps) {
   }
 
   return (
-    <header class="workspace-header">
-      <div class="toolbar">
+    <header class="grid gap-3.5">
+      <div class="flex flex-col items-start justify-between gap-3 min-[761px]:flex-row min-[761px]:items-center">
         <Show
           when={props.session}
           fallback={
             <div>
-              <h1>Harlan</h1>
-              <p>No session selected</p>
+              <h1 class="text-2xl font-bold">Harlan</h1>
+              <p class="text-[#66706a]">No session selected</p>
             </div>
           }
         >
           {(current) => (
-            <div class="session-title">
+            <div class="grid min-w-0 gap-1">
               <input
+                class="w-full min-w-0 max-w-[560px] border-0 bg-transparent p-0 text-2xl font-bold text-[#18201f] focus:outline-3 focus:outline-[#cce7ed]"
                 value={draftTitle()}
                 onInput={(event) => setDraftTitle(event.currentTarget.value)}
                 onBlur={() => void renameCurrentSession()}
@@ -213,19 +271,24 @@ function SessionHeader(props: SessionHeaderProps) {
                 }}
                 aria-label="Session title"
               />
-              <p>{current().resourceId}</p>
+              <p class="text-[#66706a]">{current().resourceId}</p>
             </div>
           )}
         </Show>
-        <span class={`status status-${props.status}`}>{props.status}</span>
+        <span class={statusClass(props.status)}>{props.status}</span>
       </div>
 
-      <div class="session-actions">
-        <button type="button" onClick={() => void renameCurrentSession()} disabled={!props.session}>
+      <div class="flex flex-wrap gap-2.5">
+        <button
+          class={primaryButtonClass}
+          type="button"
+          onClick={() => void renameCurrentSession()}
+          disabled={!props.session}
+        >
           Rename
         </button>
         <button
-          class="secondary-button"
+          class={secondaryButtonClass}
           type="button"
           onClick={() => void props.deleteSession()}
           disabled={!props.session}
@@ -243,12 +306,15 @@ type EventLogProps = {
 
 function EventLog(props: EventLogProps) {
   return (
-    <section class="event-log-panel" aria-label="Event log">
+    <section
+      class="min-h-[280px] flex-1 overflow-auto rounded-lg border border-[#cbd2ca] bg-white p-[18px]"
+      aria-label="Event log"
+    >
       <Show
         when={props.events.length > 0}
-        fallback={<span class="empty-state">No events yet</span>}
+        fallback={<span class={emptyStateClass}>No events yet</span>}
       >
-        <ol class="event-log">
+        <ol class={`${listClass} gap-3`}>
           <For each={props.events}>{(item) => <EventLogRow item={item} />}</For>
         </ol>
       </Show>
@@ -259,7 +325,7 @@ function EventLog(props: EventLogProps) {
 function EventLogRow(props: { item: DomainLogItem }) {
   const [collapsed, setCollapsed] = createSignal(true);
   const title = createMemo(() => eventTitle(props.item.name));
-  const eventClass = createMemo(() => `event-row event-row-${props.item.name}`);
+  const eventClass = createMemo(() => eventRowClass(props.item.name));
   const collapsible = createMemo(
     () =>
       props.item.name === domainEventNames.agentExecuted ||
@@ -269,9 +335,11 @@ function EventLogRow(props: { item: DomainLogItem }) {
 
   return (
     <li class={eventClass()}>
-      <div class="event-row-header">
-        <span>{title()}</span>
-        <time>{new Date(props.item.createdAt).toLocaleString()}</time>
+      <div class="flex items-center justify-between gap-3">
+        <span class="text-xs font-bold uppercase text-[#4f5a55]">{title()}</span>
+        <time class="text-xs text-[#66706a]">
+          {new Date(props.item.createdAt).toLocaleString()}
+        </time>
       </div>
       <EventToggle
         collapsed={collapsed()}
@@ -301,7 +369,7 @@ function EventToggle(props: EventToggleProps) {
   return (
     <Show when={props.collapsible}>
       <button
-        class="event-toggle"
+        class="w-full min-w-0 cursor-pointer rounded-lg border border-[#c8c2b3] bg-white px-2.5 py-1 text-xs leading-[1.1] text-[#4f4534]"
         type="button"
         aria-expanded={props.collapsed ? "false" : "true"}
         onClick={props.toggleCollapsed}
@@ -318,31 +386,31 @@ function EventLogContent(props: { collapsed: boolean; item: DomainLogItem }) {
       case domainEventNames.sessionStarted:
         return {
           element: "p",
-          className: "system-text",
+          className: systemTextClass,
           text: props.item.data.session_path,
         } as const;
       case domainEventNames.userMessaged:
         return {
           element: "p",
-          className: "message-text",
+          className: messageTextClass,
           text: props.item.data.user_message,
         } as const;
       case domainEventNames.agentResponded:
         return {
           element: "p",
-          className: "message-text",
+          className: messageTextClass,
           text: props.item.data.agent_response,
         } as const;
       case domainEventNames.agentExecuted:
         return {
           element: "pre",
-          className: "code-output",
+          className: codeOutputClass,
           text: props.item.data.harlan_executed,
         } as const;
       case domainEventNames.executionCompleted:
         return {
           element: "pre",
-          className: "result-output",
+          className: codeOutputClass,
           text: props.item.data.result,
         } as const;
     }
@@ -354,7 +422,7 @@ function EventLogContent(props: { collapsed: boolean; item: DomainLogItem }) {
         currentContent.element === "pre" ? (
           <pre
             class={`${currentContent.className} ${
-              props.collapsed ? "event-output-collapsed" : ""
+              props.collapsed ? "max-h-12 overflow-hidden" : ""
             }`}
           >
             {currentContent.text}
@@ -390,14 +458,19 @@ function PromptComposer(props: PromptComposerProps) {
   }
 
   return (
-    <form class="prompt-form" onSubmit={submitPrompt}>
+    <form class="grid gap-3" onSubmit={submitPrompt}>
       <textarea
+        class="w-full resize-y rounded-lg border border-[#cbd2ca] bg-white p-3.5 leading-normal text-[#17201d] focus:border-[#2f6f7e] focus:outline-3 focus:outline-[#cce7ed]"
         value={prompt()}
         onInput={(event) => setPrompt(event.currentTarget.value)}
         placeholder="Ask Harlan to inspect the repo, summarize files, or continue this session."
         rows={8}
       />
-      <button type="submit" disabled={!prompt().trim() || props.disabled}>
+      <button
+        class={primaryButtonClass}
+        type="submit"
+        disabled={!prompt().trim() || props.disabled}
+      >
         {props.running ? "Running" : "Run"}
       </button>
     </form>
@@ -635,7 +708,7 @@ export default function App() {
   }
 
   return (
-    <main class="app-shell">
+    <main class={appShellClass}>
       <SessionSidebar
         sessions={sessions()}
         loading={isPending(sessions)}
@@ -644,7 +717,7 @@ export default function App() {
         selectSession={(sessionId) => void selectSession(sessionId)}
       />
 
-      <section class="workspace-pane">
+      <section class="flex min-w-0 flex-col gap-[18px] p-[18px] min-[761px]:p-7">
         <SessionHeader
           session={detail.session}
           status={status()}
@@ -657,7 +730,7 @@ export default function App() {
         <PromptComposer disabled={promptDisabled()} running={running()} submitRun={submitRun} />
 
         <Show when={error()}>
-          <pre class="error-output">{error()}</pre>
+          <pre class={errorOutputClass}>{error()}</pre>
         </Show>
       </section>
     </main>

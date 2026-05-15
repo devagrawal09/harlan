@@ -31,7 +31,11 @@ describe("SessionStore", () => {
     const run = firstStore.createRun(session.id, "Summarize the repo", "openrouter/test-model");
 
     firstStore.appendRunAnswer(run.id, "summary");
-    firstStore.appendRunEvent(run.id, "text-delta", JSON.stringify({ payload: { text: "summary" } }));
+    firstStore.appendRunEvent(
+      run.id,
+      "text-delta",
+      JSON.stringify({ payload: { text: "summary" } }),
+    );
     firstStore.completeRun(run.id);
 
     const secondStore = new SessionStore({ stateDir });

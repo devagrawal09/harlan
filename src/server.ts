@@ -2,8 +2,8 @@
 
 import "dotenv/config";
 import { serve } from "@hono/node-server";
+import type { MessageListInput } from "@mastra/core/agent/message-list";
 import type { AgentChunkType } from "@mastra/core/stream";
-import type { Memory } from "@mastra/memory";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
@@ -16,24 +16,12 @@ import {
   type DomainEventPayloadMap,
   type EventLogItem,
 } from "../events.ts";
-import {
-  assertProviderConfig,
-  createHarlanAgent,
-  createHarlanMemory,
-  defaultModel,
-} from "./agent.ts";
-import { HARLAN_RESOURCE_ID, SessionStore, type RunRecord } from "./session-store.ts";
+import { assertProviderConfig, createHarlanAgent, defaultModel } from "./agent.ts";
+import { SessionStore, type RunRecord, type SessionMessage } from "./session-store.ts";
 
 type AgentStream = {
   fullStream: AsyncIterable<AgentChunkType>;
   error?: unknown;
-};
-
-type AgentStreamOptions = {
-  memory?: {
-    resource: string;
-    thread: string;
-  };
 };
 
 type SessionSseMessage = {
@@ -74,13 +62,12 @@ class SessionEventHub {
 }
 
 export type ServerAgent = {
-  stream(prompt: string, options?: AgentStreamOptions): Promise<AgentStream>;
+  stream(messages: MessageListInput, options?: unknown): Promise<AgentStream>;
 };
 
 export type ServerOptions = {
   createAgent?: (model: string) => ServerAgent;
   env?: NodeJS.ProcessEnv;
-  memory?: Memory;
   sessionStore?: SessionStore;
   stateDir?: string;
 };
@@ -183,6 +170,19 @@ function readExecuteHarlanResult(payload: ExecuteHarlanPayload): string | null {
   return payload.result ?? payload.output ?? payload.text ?? payload.content ?? null;
 }
 
+function createRunMessages(previousMessages: SessionMessage[], prompt: string): MessageListInput {
+  return [
+    ...previousMessages.map((message) => ({
+      role: message.role,
+      content: message.text,
+    })),
+    {
+      role: "user",
+      content: prompt,
+    },
+  ];
+}
+
 function projectRunToDomainEvents(run: RunRecord): EventLogItem[] {
   const events: EventLogItem[] = [
     createEventLogItem(
@@ -255,10 +255,8 @@ function projectRunToDomainEvents(run: RunRecord): EventLogItem[] {
 
 export function createServer(options: ServerOptions = {}): Hono {
   const sessionStore = options.sessionStore ?? new SessionStore({ stateDir: options.stateDir });
-  const memory =
-    options.memory ?? (options.createAgent ? undefined : createHarlanMemory(sessionStore.stateDir));
   const createAgent =
-    options.createAgent ?? ((model: string) => createHarlanAgent(model, { memory }) as ServerAgent);
+    options.createAgent ?? ((model: string) => createHarlanAgent(model) as ServerAgent);
   const env = options.env ?? process.env;
   const sessionEvents = new SessionEventHub();
   const app = new Hono();
@@ -385,7 +383,6 @@ export function createServer(options: ServerOptions = {}): Hono {
 
     sessionEvents.publish(sessionId, "sessionDeleted", { sessionId });
     sessionStore.deleteSession(sessionId);
-    await memory?.deleteThread(sessionId);
 
     return c.json({ ok: true });
   });
@@ -431,6 +428,7 @@ export function createServer(options: ServerOptions = {}): Hono {
     }
 
     const agent = createAgent(model);
+    const previousMessages = sessionStore.listMessages(sessionId);
     const run = sessionStore.createRun(sessionId, prompt, model);
     const userMessaged = createEventLogItem(domainEventNames.userMessaged, {
       session_path: sessionId,
@@ -447,7 +445,7 @@ export function createServer(options: ServerOptions = {}): Hono {
     sessionEvents.publish(sessionId, "sessionUpdated", {
       session: sessionStore.getSession(sessionId),
     });
-    void runAgent({ agent, prompt, runId: run.id, sessionId });
+    void runAgent({ agent, previousMessages, prompt, runId: run.id, sessionId });
 
     return c.body(null, 204);
   }
@@ -488,22 +486,19 @@ export function createServer(options: ServerOptions = {}): Hono {
 
   async function runAgent({
     agent,
+    previousMessages,
     prompt,
     runId,
     sessionId,
   }: {
     agent: ServerAgent;
+    previousMessages: SessionMessage[];
     prompt: string;
     runId: string;
     sessionId: string;
   }) {
     try {
-      const output = await agent.stream(prompt, {
-        memory: {
-          resource: HARLAN_RESOURCE_ID,
-          thread: sessionId,
-        },
-      });
+      const output = await agent.stream(createRunMessages(previousMessages, prompt));
       let agentResponse = "";
 
       for await (const chunk of output.fullStream) {

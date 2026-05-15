@@ -2,19 +2,12 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { MessageListInput } from "@mastra/core/agent/message-list";
 import type { AgentChunkType } from "@mastra/core/stream";
 import { onTestFinished, test } from "vitest";
+import { defaultModel } from "./agent.ts";
 import { createServer, type ServerAgent } from "./server.ts";
 import { SseEventParser, parseSseEvent, type SseEvent } from "../web/src/events.ts";
-
-type AgentMemoryCall = {
-  thread: string;
-  resource: string;
-};
-
-type AgentStreamOptions = {
-  memory?: AgentMemoryCall;
-};
 
 async function createTempStateDir() {
   const stateDir = await mkdtemp(join(tmpdir(), "harlan-state-"));
@@ -218,7 +211,10 @@ test("session API creates, lists, renames, loads, and deletes sessions", async (
     body: JSON.stringify({ title: "Renamed session" }),
   });
   assert.equal(renamed.status, 200);
-  assert.equal(((await renamed.json()) as { session: { title: string } }).session.title, "Renamed session");
+  assert.equal(
+    ((await renamed.json()) as { session: { title: string } }).session.title,
+    "Renamed session",
+  );
 
   const detail = await app.request(`/api/sessions/${createdBody.session.id}`);
   assert.equal(detail.status, 200);
@@ -280,12 +276,15 @@ test("sessions persist on disk across server instances", async () => {
   assert.equal(listed.status, 200);
   const body = (await listed.json()) as { sessions: Array<{ id: string; title: string }> };
 
-  assert.deepEqual(body.sessions.map(({ id, title }) => ({ id, title })), [
-    {
-      id: session.id,
-      title: "Persistent session",
-    },
-  ]);
+  assert.deepEqual(
+    body.sessions.map(({ id, title }) => ({ id, title })),
+    [
+      {
+        id: session.id,
+        title: "Persistent session",
+      },
+    ],
+  );
 });
 
 test("GET /api/sessions/:sessionId streams initial snapshot", async () => {
@@ -349,13 +348,11 @@ test("POST /api/sessions/:sessionId/runs returns 204 and publishes run events", 
       },
     } as AgentChunkType,
   ];
-  const prompts: string[] = [];
-  const memoryCalls: Array<AgentMemoryCall | undefined> = [];
+  const messages: MessageListInput[] = [];
   const models: string[] = [];
   const fakeAgent: ServerAgent = {
-    async stream(prompt: string, options?: AgentStreamOptions) {
-      prompts.push(prompt);
-      memoryCalls.push(options?.memory);
+    async stream(inputMessages: MessageListInput) {
+      messages.push(inputMessages);
 
       return {
         fullStream: (async function* () {
@@ -427,14 +424,8 @@ test("POST /api/sessions/:sessionId/runs returns 204 and publishes run events", 
   assert.equal(agentResponded.name, "agentResponded");
   assert.equal(agentResponded.data.session_path, sessionId);
   assert.equal(agentResponded.data.agent_response, "hello");
-  assert.deepEqual(prompts, ["Say hello"]);
-  assert.deepEqual(models, ["openrouter/google/gemini-2.0-flash-lite-001"]);
-  assert.deepEqual(memoryCalls, [
-    {
-      resource: "harlan-workspace",
-      thread: sessionId,
-    },
-  ]);
+  assert.deepEqual(messages, [[{ role: "user", content: "Say hello" }]]);
+  assert.deepEqual(models, [defaultModel]);
 
   const detail = await app.request(`/api/sessions/${sessionId}`);
   const detailEvents = await readEventsUntil(detail, "sessionSnapshot");
@@ -464,6 +455,23 @@ test("POST /api/sessions/:sessionId/runs returns 204 and publishes run events", 
   );
   assert.equal(detailBody.events[1]?.data.user_message, "Say hello");
   assert.equal(detailBody.events[2]?.data.agent_response, "hello");
+
+  const followup = await app.request(`/api/sessions/${sessionId}/runs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ prompt: "Continue" }),
+  });
+
+  assert.equal(followup.status, 204);
+  await waitForCondition(() => {
+    assert.deepEqual(messages[1], [
+      { role: "user", content: "Say hello" },
+      { role: "assistant", content: "hello" },
+      { role: "user", content: "Continue" },
+    ]);
+  });
 });
 
 test("POST /api/sessions/:sessionId/runs publishes Harlan execution events", async () => {
@@ -566,13 +574,7 @@ test("POST /api/sessions/:sessionId/runs publishes Harlan execution events", asy
 
   assert.deepEqual(
     snapshot.events.map((event) => event.name),
-    [
-      "sessionStarted",
-      "userMessaged",
-      "agentExecuted",
-      "executionCompleted",
-      "agentResponded",
-    ],
+    ["sessionStarted", "userMessaged", "agentExecuted", "executionCompleted", "agentResponded"],
   );
   assert.equal(snapshot.events[2]?.data.harlan_executed, "fs.cwd()");
   assert.equal(snapshot.events[3]?.data.result, "/tmp/project");
@@ -678,11 +680,11 @@ test("POST /api/runs returns 204 and runs agent without live model calls", async
       },
     } as AgentChunkType,
   ];
-  const prompts: string[] = [];
+  const messages: MessageListInput[] = [];
   const models: string[] = [];
   const fakeAgent: ServerAgent = {
-    async stream(prompt) {
-      prompts.push(prompt);
+    async stream(inputMessages) {
+      messages.push(inputMessages);
 
       return {
         fullStream: (async function* () {
@@ -712,7 +714,7 @@ test("POST /api/runs returns 204 and runs agent without live model calls", async
 
   assert.equal(response.status, 204);
   await waitForCondition(() => {
-    assert.deepEqual(prompts, ["Say hello"]);
-    assert.deepEqual(models, ["openrouter/google/gemini-2.0-flash-lite-001"]);
+    assert.deepEqual(messages, [[{ role: "user", content: "Say hello" }]]);
+    assert.deepEqual(models, [defaultModel]);
   });
 });
