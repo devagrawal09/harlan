@@ -341,12 +341,6 @@ function EventLogRow(props: { item: DomainLogItem }) {
           {new Date(props.item.createdAt).toLocaleString()}
         </time>
       </div>
-      <EventToggle
-        collapsed={collapsed()}
-        collapsible={collapsible()}
-        toggleLabel={toggleLabel()}
-        toggleCollapsed={() => setCollapsed((current) => !current)}
-      />
       <EventLogContent collapsed={collapsible() && collapsed()} item={props.item} />
       <EventToggle
         collapsed={collapsed()}
@@ -369,7 +363,7 @@ function EventToggle(props: EventToggleProps) {
   return (
     <Show when={props.collapsible}>
       <button
-        class="w-full min-w-0 cursor-pointer rounded-lg border border-[#c8c2b3] bg-white px-2.5 py-1 text-xs leading-[1.1] text-[#4f4534]"
+        class="w-full min-w-0 cursor-pointer rounded-lg border border-[#c8c2b3] bg-white px-2.5 pb-1 pt-0 text-xs leading-[1.1] text-[#4f4534]"
         type="button"
         aria-expanded={props.collapsed ? "false" : "true"}
         onClick={props.toggleCollapsed}

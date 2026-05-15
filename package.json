@@ -10,6 +10,7 @@
     "build": "npm run build:web",
     "build:web": "vite build --config web/vite.config.ts",
     "dev": "concurrently -k -n server,web \"npm run dev:server\" \"npm run dev:web\"",
+    "dev:kill": "sh -c 'for port in 43117 3167; do pids=$(lsof -tiTCP:$port -sTCP:LISTEN); [ -z \"$pids\" ] || kill $pids; done'",
     "dev:server": "PORT=43117 HOST=127.0.0.1 node --watch ./src/server.ts",
     "dev:web": "vite --config web/vite.config.ts --port 3167 --strictPort --host 127.0.0.1",
     "e2e": "playwright test",
