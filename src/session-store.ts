@@ -113,7 +113,9 @@ export class SessionStore {
     try {
       parsed = JSON.parse(readFileSync(this.statePath, "utf8"));
     } catch (error) {
-      throw new Error(`Failed to load Harlan state from ${this.statePath}: ${String(error)}`);
+      throw new Error(`Failed to load Harlan state from ${this.statePath}: ${String(error)}`, {
+        cause: error,
+      });
     }
 
     const result = persistedStateSchema.safeParse(parsed);
@@ -157,6 +159,10 @@ export class SessionStore {
   getSession(sessionId: string): SessionDetail | null {
     const session = this.#state.sessions[sessionId];
     return session ? toDetail(session) : null;
+  }
+
+  getRun(runId: string): RunRecord | null {
+    return this.#state.runs[runId] ?? null;
   }
 
   updateSessionTitle(sessionId: string, title: string): SessionDetail | null {

@@ -1,4 +1,11 @@
-import { createMemo, createSignal, isPending, refresh } from "solid-js";
+import {
+  createMemo,
+  createSignal,
+  createStore,
+  isPending,
+  onCleanup,
+  refresh,
+} from "solid-js";
 import { For, Show } from "@solidjs/web";
 import { SseEventParser, type SseEvent } from "./events";
 
@@ -35,11 +42,16 @@ type SessionDetail = SessionSummary & {
   resourceId: string;
 };
 
+type TimelineEvent = SseEvent & {
+  id: number;
+};
+
 type SessionProjection = {
   session: SessionDetail | null;
   runs: RunRecord[];
   messages: unknown[];
-  error: string;
+  events: TimelineEvent[];
+  streamError: string;
 };
 
 type SessionsProjection = {
@@ -47,8 +59,24 @@ type SessionsProjection = {
   error: string;
 };
 
-type TimelineEvent = SseEvent & {
-  id: number;
+type SessionSnapshot = {
+  session: SessionDetail | null;
+  runs: RunRecord[];
+  messages: unknown[];
+};
+
+type SessionUpdatedPayload = {
+  session: SessionDetail | null;
+};
+
+type RunEventPayload = {
+  runId: string;
+  sessionId: string;
+  payload?: {
+    text?: unknown;
+  };
+  run?: RunRecord | null;
+  error?: string;
 };
 
 const apiBaseUrl = (
@@ -63,7 +91,7 @@ function readChunkText(event: SseEvent): string {
   }
 
   try {
-    const parsed = JSON.parse(event.data) as { payload?: { text?: unknown } };
+    const parsed = JSON.parse(event.data) as RunEventPayload;
     return typeof parsed.payload?.text === "string" ? parsed.payload.text : "";
   } catch {
     return "";
@@ -111,14 +139,67 @@ async function createSessionRequest(title?: string): Promise<SessionDetail> {
   return data.session;
 }
 
+function emptySessionProjection(): SessionProjection {
+  return {
+    session: null,
+    runs: [],
+    messages: [],
+    events: [],
+    streamError: "",
+  };
+}
+
+function replaceSessionProjection(draft: SessionProjection, next: SessionProjection): void {
+  draft.session = next.session;
+  draft.runs = next.runs;
+  draft.messages = next.messages;
+  draft.events = next.events;
+  draft.streamError = next.streamError;
+}
+
+function readEventPayload<T>(event: SseEvent): T | null {
+  try {
+    return JSON.parse(event.data) as T;
+  } catch {
+    return null;
+  }
+}
+
+function upsertRun(runs: RunRecord[], run: RunRecord): RunRecord[] {
+  const index = runs.findIndex((item) => item.id === run.id);
+
+  if (index === -1) {
+    return [...runs, run].sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+  }
+
+  return runs.map((item) => (item.id === run.id ? run : item));
+}
+
+function updateRun(
+  runs: RunRecord[],
+  runId: string,
+  update: (run: RunRecord) => RunRecord,
+): RunRecord[] {
+  return runs.map((run) => (run.id === runId ? update(run) : run));
+}
+
+function persistedTimelineEvents(runs: RunRecord[], nextId: () => number): TimelineEvent[] {
+  return runs.flatMap((run) =>
+    run.events.map((event) => ({
+      id: nextId(),
+      event: event.event,
+      data: event.data,
+    })),
+  );
+}
+
 export default function App() {
   const [selectedSessionOverride, setSelectedSessionId] = createSignal("");
   const [prompt, setPrompt] = createSignal("");
-  const [status, setStatus] = createSignal<RunStatus>("idle");
-  const [answer, setAnswer] = createSignal("");
-  const [events, setEvents] = createSignal<TimelineEvent[]>([]);
+  const [submitting, setSubmitting] = createSignal(false);
   const [mutationError, setMutationError] = createSignal("");
   let nextEventId = 1;
+  const nextTimelineEventId = () => nextEventId++;
 
   const [sessionState] = createSignal<SessionsProjection>(async () => {
     try {
@@ -146,44 +227,170 @@ export default function App() {
     () => selectedSessionOverride() || sessions()[0]?.id || "",
   );
 
-  const [detail] = createSignal<SessionProjection>(async () => {
-    const sessionId = selectedSessionId();
+  const [detail] = createStore<SessionProjection>(
+    async (draft) => {
+      const sessionId = selectedSessionId();
 
-    if (!sessionId) {
-      return {
-        session: null,
-        runs: [],
-        messages: [],
-        error: "",
-      };
-    }
+      if (!sessionId) {
+        replaceSessionProjection(draft, emptySessionProjection());
+        return;
+      }
 
-    try {
-      const data = await readJson<Omit<SessionProjection, "error">>(
-        await fetch(`${apiBaseUrl}/api/sessions/${sessionId}`),
-      );
+      const controller = new AbortController();
+      onCleanup(() => controller.abort());
 
-      return {
-        ...data,
-        error: "",
-      };
-    } catch (caught) {
-      return {
-        session: null,
-        runs: [],
-        messages: [],
-        error: caught instanceof Error ? caught.message : String(caught),
-      };
-    }
-  });
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/sessions/${sessionId}`, {
+          signal: controller.signal,
+        });
 
-  const runs = createMemo(() => detail().runs);
-  const session = createMemo(() => detail().session);
+        if (!response.ok || !response.body) {
+          const text = await response.text();
+          let message = text || `Request failed with ${response.status}`;
+
+          try {
+            const data = JSON.parse(text) as { error?: unknown };
+            message = typeof data.error === "string" ? data.error : message;
+          } catch {
+            // Keep the raw response text when the server did not return JSON.
+          }
+
+          replaceSessionProjection(draft, {
+            ...emptySessionProjection(),
+            streamError: message,
+          });
+          return;
+        }
+
+        replaceSessionProjection(draft, emptySessionProjection());
+
+        const parser = new SseEventParser();
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        for (;;) {
+          const { value, done } = await reader.read();
+
+          if (done) {
+            break;
+          }
+
+          applySessionEvents(draft, parser.push(decoder.decode(value, { stream: true })));
+        }
+
+        applySessionEvents(draft, parser.push(decoder.decode()));
+        applySessionEvents(draft, parser.flush());
+      } catch (caught) {
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        replaceSessionProjection(draft, {
+          ...emptySessionProjection(),
+          streamError: caught instanceof Error ? caught.message : String(caught),
+        });
+      }
+    },
+    emptySessionProjection(),
+  );
+
+  const runs = createMemo(() => detail.runs);
+  const events = createMemo(() => detail.events);
+  const session = createMemo(() => detail.session);
   const selectedSession = createMemo(() =>
     sessions().find((item) => item.id === selectedSessionId()),
   );
-  const error = createMemo(() => mutationError() || sessionState().error || detail().error);
+  const runningRun = createMemo(() => runs().find((run) => run.status === "running"));
+  const status = createMemo<RunStatus>(() => {
+    if (runningRun() || submitting()) {
+      return "running";
+    }
+
+    return runs().at(-1)?.status ?? "idle";
+  });
+  const error = createMemo(() => mutationError() || sessionState().error || detail.streamError);
   const [draftTitle, setDraftTitle] = createSignal(() => session()?.title ?? "");
+
+  function applySessionEvents(draft: SessionProjection, parsedEvents: SseEvent[]) {
+    for (const parsedEvent of parsedEvents) {
+      if (parsedEvent.event === "heartbeat") {
+        continue;
+      }
+
+      draft.events = [
+        ...draft.events,
+        {
+          ...parsedEvent,
+          id: nextTimelineEventId(),
+        },
+      ];
+
+      if (
+        parsedEvent.event === "run-start" ||
+        parsedEvent.event === "done" ||
+        parsedEvent.event === "error" ||
+        parsedEvent.event === "session-updated"
+      ) {
+        refresh(sessionState);
+      }
+
+      if (parsedEvent.event === "session-snapshot") {
+        const payload = readEventPayload<SessionSnapshot>(parsedEvent);
+
+        if (payload) {
+          draft.session = payload.session;
+          draft.runs = payload.runs;
+          draft.messages = payload.messages;
+          draft.events = persistedTimelineEvents(payload.runs, nextTimelineEventId);
+          draft.streamError = "";
+        }
+      }
+
+      if (parsedEvent.event === "session-updated") {
+        const payload = readEventPayload<SessionUpdatedPayload>(parsedEvent);
+        draft.session = payload?.session ?? draft.session;
+      }
+
+      if (parsedEvent.event === "session-deleted") {
+        replaceSessionProjection(draft, emptySessionProjection());
+      }
+
+      if (parsedEvent.event === "run-start") {
+        const payload = readEventPayload<RunEventPayload>(parsedEvent);
+
+        if (payload?.run) {
+          draft.runs = upsertRun(draft.runs, payload.run);
+          setSubmitting(false);
+        }
+      }
+
+      if (parsedEvent.event === "text-delta") {
+        const payload = readEventPayload<RunEventPayload>(parsedEvent);
+        const text = readChunkText(parsedEvent);
+
+        if (payload && text) {
+          draft.runs = updateRun(draft.runs, payload.runId, (run) => ({
+            ...run,
+            answer: `${run.answer}${text}`,
+          }));
+        }
+      }
+
+      if (parsedEvent.event === "done" || parsedEvent.event === "error") {
+        const payload = readEventPayload<RunEventPayload>(parsedEvent);
+
+        if (payload?.run) {
+          draft.runs = upsertRun(draft.runs, payload.run);
+        }
+
+        if (parsedEvent.event === "error") {
+          draft.streamError = payload?.error ?? parsedEvent.data;
+        }
+
+        setSubmitting(false);
+      }
+    }
+  }
 
   async function createSession(title?: string) {
     const session = await createSessionRequest(title);
@@ -209,9 +416,7 @@ export default function App() {
     }
 
     setSelectedSessionId(sessionId);
-    setStatus("idle");
-    setAnswer("");
-    setEvents([]);
+    setSubmitting(false);
     setMutationError("");
   }
 
@@ -236,7 +441,6 @@ export default function App() {
       );
       setDraftTitle(data.session.title);
       refresh(sessionState);
-      refresh(detail);
     } catch (caught) {
       setMutationError(caught instanceof Error ? caught.message : String(caught));
     }
@@ -277,9 +481,7 @@ export default function App() {
       return;
     }
 
-    setStatus("running");
-    setAnswer("");
-    setEvents([]);
+    setSubmitting(true);
     setMutationError("");
 
     try {
@@ -291,67 +493,16 @@ export default function App() {
         body: JSON.stringify({ prompt: trimmedPrompt }),
       });
 
-      if (!response.ok || !response.body) {
+      if (!response.ok) {
         const message = await response.text();
         throw new Error(message || `Request failed with ${response.status}`);
       }
 
-      const parser = new SseEventParser();
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-
-      for (;;) {
-        const { value, done } = await reader.read();
-
-        if (done) {
-          break;
-        }
-
-        const parsedEvents = parser.push(decoder.decode(value, { stream: true }));
-        handleEvents(parsedEvents);
-      }
-
-      handleEvents(parser.push(decoder.decode()));
-      handleEvents(parser.flush());
-
-      setStatus((current) => (current === "running" ? "done" : current));
       setPrompt("");
-      refresh(detail);
       refresh(sessionState);
     } catch (caught) {
-      setStatus("error");
+      setSubmitting(false);
       setMutationError(caught instanceof Error ? caught.message : String(caught));
-    }
-  }
-
-  function handleEvents(parsedEvents: SseEvent[]) {
-    if (parsedEvents.length === 0) {
-      return;
-    }
-
-    setEvents((current) => [
-      ...current,
-      ...parsedEvents.map((item) => ({
-        ...item,
-        id: nextEventId++,
-      })),
-    ]);
-
-    for (const parsedEvent of parsedEvents) {
-      const text = readChunkText(parsedEvent);
-
-      if (text) {
-        setAnswer((current) => current + text);
-      }
-
-      if (parsedEvent.event === "error") {
-        setStatus("error");
-        setMutationError(parsedEvent.data);
-      }
-
-      if (parsedEvent.event === "done") {
-        setStatus("done");
-      }
     }
   }
 
@@ -432,10 +583,7 @@ export default function App() {
         </div>
 
         <section class="history-panel" aria-label="Session history">
-          <Show
-            when={runs().length > 0 || answer()}
-            fallback={<span class="empty-state">No runs yet</span>}
-          >
+          <Show when={runs().length > 0} fallback={<span class="empty-state">No runs yet</span>}>
             <ol class="run-list">
               <For each={runs()}>
                 {(item) => (
@@ -452,16 +600,6 @@ export default function App() {
                   </li>
                 )}
               </For>
-              <Show when={answer()}>
-                <li class="run-card run-card-active">
-                  <div class="run-card-header">
-                    <span>{status()}</span>
-                    <time>Streaming</time>
-                  </div>
-                  <p class="prompt-text">{prompt()}</p>
-                  <pre>{answer()}</pre>
-                </li>
-              </Show>
             </ol>
           </Show>
         </section>

@@ -29,6 +29,43 @@ type AgentStreamOptions = {
   };
 };
 
+type SessionSseMessage = {
+  event: string;
+  data: unknown;
+};
+
+type SessionSubscriber = (message: SessionSseMessage) => Promise<void>;
+
+class SessionEventHub {
+  #subscribers = new Map<string, Set<SessionSubscriber>>();
+
+  subscribe(sessionId: string, subscriber: SessionSubscriber): () => void {
+    const subscribers = this.#subscribers.get(sessionId) ?? new Set<SessionSubscriber>();
+    subscribers.add(subscriber);
+    this.#subscribers.set(sessionId, subscribers);
+
+    return () => {
+      subscribers.delete(subscriber);
+
+      if (subscribers.size === 0) {
+        this.#subscribers.delete(sessionId);
+      }
+    };
+  }
+
+  publish(sessionId: string, event: string, data: unknown): void {
+    const subscribers = this.#subscribers.get(sessionId);
+
+    if (!subscribers) {
+      return;
+    }
+
+    for (const subscriber of subscribers) {
+      void subscriber({ event, data });
+    }
+  }
+}
+
 export type ServerAgent = {
   stream(prompt: string, options?: AgentStreamOptions): Promise<AgentStream>;
 };
@@ -76,6 +113,7 @@ export function createServer(options: ServerOptions = {}): Hono {
   const createAgent =
     options.createAgent ?? ((model: string) => createHarlanAgent(model, { memory }) as ServerAgent);
   const env = options.env ?? process.env;
+  const sessionEvents = new SessionEventHub();
   const app = new Hono();
 
   app.use(
@@ -123,10 +161,40 @@ export function createServer(options: ServerOptions = {}): Hono {
       return c.json({ error: "Session not found." }, 404);
     }
 
-    return c.json({
-      session,
-      runs: sessionStore.listRuns(sessionId),
-      messages: sessionStore.listMessages(sessionId),
+    return streamSSE(c, async (stream) => {
+      const writeMessage = async ({ event, data }: SessionSseMessage) => {
+        if (stream.closed || stream.aborted) {
+          return;
+        }
+
+        await stream.writeSSE({
+          event,
+          data: JSON.stringify(data),
+        });
+      };
+      let pendingWrite = Promise.resolve();
+      const enqueueMessage = (message: SessionSseMessage) => {
+        pendingWrite = pendingWrite.then(() => writeMessage(message)).catch(() => undefined);
+        return pendingWrite;
+      };
+      const unsubscribe = sessionEvents.subscribe(sessionId, enqueueMessage);
+      const heartbeat = setInterval(() => {
+        void enqueueMessage({ event: "heartbeat", data: { ok: true } });
+      }, 15_000);
+
+      stream.onAbort(() => {
+        unsubscribe();
+        clearInterval(heartbeat);
+      });
+
+      await enqueueMessage({
+        event: "session-snapshot",
+        data: getSessionSnapshot(sessionId),
+      });
+
+      await new Promise<void>((resolve) => {
+        stream.onAbort(resolve);
+      });
     });
   });
 
@@ -152,6 +220,8 @@ export function createServer(options: ServerOptions = {}): Hono {
       return c.json({ error: "Session not found." }, 404);
     }
 
+    sessionEvents.publish(sessionId, "session-updated", { session });
+
     return c.json({ session });
   });
 
@@ -166,6 +236,7 @@ export function createServer(options: ServerOptions = {}): Hono {
       return c.json({ error: "Cannot delete a session with a running run." }, 409);
     }
 
+    sessionEvents.publish(sessionId, "session-deleted", { sessionId });
     sessionStore.deleteSession(sessionId);
     await memory?.deleteThread(sessionId);
 
@@ -215,51 +286,96 @@ export function createServer(options: ServerOptions = {}): Hono {
     const agent = createAgent(model);
     const run = sessionStore.createRun(sessionId, prompt, model);
 
-    return streamSSE(c, async (stream) => {
-      async function writeEvent(event: string, data: unknown) {
-        const serialized = JSON.stringify(data);
-        sessionStore.appendRunEvent(run.id, event, serialized);
-        await stream.writeSSE({ event, data: serialized });
-      }
+    writeRunEvent(run.id, "run-start", {
+      runId: run.id,
+      sessionId,
+      model,
+      run,
+    });
+    sessionEvents.publish(sessionId, "session-updated", {
+      session: sessionStore.getSession(sessionId),
+    });
+    void runAgent({ agent, prompt, runId: run.id, sessionId });
 
-      await writeEvent("run-start", {
-        runId: run.id,
-        sessionId,
-        model,
+    return c.body(null, 204);
+  }
+
+  function getSessionSnapshot(sessionId: string) {
+    return {
+      session: sessionStore.getSession(sessionId),
+      runs: sessionStore.listRuns(sessionId),
+      messages: sessionStore.listMessages(sessionId),
+    };
+  }
+
+  function writeRunEvent(runId: string, event: string, data: unknown): void {
+    const serialized = JSON.stringify(data);
+    sessionStore.appendRunEvent(runId, event, serialized);
+    const run = sessionStore.getRun(runId);
+
+    if (run) {
+      sessionEvents.publish(run.sessionId, event, data);
+    }
+  }
+
+  async function runAgent({
+    agent,
+    prompt,
+    runId,
+    sessionId,
+  }: {
+    agent: ServerAgent;
+    prompt: string;
+    runId: string;
+    sessionId: string;
+  }) {
+    try {
+      const output = await agent.stream(prompt, {
+        memory: {
+          resource: HARLAN_RESOURCE_ID,
+          thread: sessionId,
+        },
       });
 
-      try {
-        const output = await agent.stream(prompt, {
-          memory: {
-            resource: HARLAN_RESOURCE_ID,
-            thread: sessionId,
-          },
-        });
+      for await (const chunk of output.fullStream) {
+        const eventData = {
+          runId,
+          sessionId,
+          type: chunk.type,
+          payload: (chunk as { payload?: unknown }).payload,
+          chunk,
+        };
 
-        for await (const chunk of output.fullStream) {
-          if (chunk.type === "text-delta") {
-            const text = (chunk as { payload?: { text?: unknown } }).payload?.text;
+        if (chunk.type === "text-delta") {
+          const text = (chunk as { payload?: { text?: unknown } }).payload?.text;
 
-            if (typeof text === "string") {
-              sessionStore.appendRunAnswer(run.id, text);
-            }
+          if (typeof text === "string") {
+            sessionStore.appendRunAnswer(runId, text);
           }
-
-          await writeEvent(chunk.type, chunk);
         }
 
-        if (output.error) {
-          throw output.error;
-        }
-
-        sessionStore.completeRun(run.id);
-        await writeEvent("done", { ok: true, runId: run.id, sessionId });
-      } catch (error) {
-        const message = toErrorMessage(error);
-        sessionStore.failRun(run.id, message);
-        await writeEvent("error", { error: message, runId: run.id, sessionId });
+        writeRunEvent(runId, chunk.type, eventData);
       }
-    });
+
+      if (output.error) {
+        throw output.error;
+      }
+
+      sessionStore.completeRun(runId);
+      const run = sessionStore.getRun(runId);
+      writeRunEvent(runId, "done", { ok: true, runId, sessionId, run });
+      sessionEvents.publish(sessionId, "session-updated", {
+        session: sessionStore.getSession(sessionId),
+      });
+    } catch (error) {
+      const message = toErrorMessage(error);
+      sessionStore.failRun(runId, message);
+      const run = sessionStore.getRun(runId);
+      writeRunEvent(runId, "error", { error: message, runId, sessionId, run });
+      sessionEvents.publish(sessionId, "session-updated", {
+        session: sessionStore.getSession(sessionId),
+      });
+    }
   }
 
   return app;

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { AgentChunkType } from "@mastra/core/stream";
 import { onTestFinished, test } from "vitest";
 import { createServer, type ServerAgent } from "./server.ts";
-import { SseEventParser, parseSseEvent } from "../web/src/events.ts";
+import { SseEventParser, parseSseEvent, type SseEvent } from "../web/src/events.ts";
 
 type AgentMemoryCall = {
   thread: string;
@@ -16,17 +16,71 @@ type AgentStreamOptions = {
   memory?: AgentMemoryCall;
 };
 
-function collectEvents(text: string) {
-  const parser = new SseEventParser();
-  return [...parser.push(text), ...parser.flush()];
-}
-
 async function createTempStateDir() {
   const stateDir = await mkdtemp(join(tmpdir(), "harlan-state-"));
   onTestFinished(async () => {
     await rm(stateDir, { recursive: true, force: true });
   });
   return stateDir;
+}
+
+async function readEventsUntil(response: Response, stopEvent: string): Promise<SseEvent[]> {
+  assert.ok(response.body);
+  const parser = new SseEventParser();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const events: SseEvent[] = [];
+
+  try {
+    for (;;) {
+      let timeoutId: NodeJS.Timeout | undefined;
+      const { value, done } = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error(`Timed out waiting for ${stopEvent}`)),
+            1_000,
+          );
+        }),
+      ]).finally(() => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+      });
+
+      if (done) {
+        events.push(...parser.push(decoder.decode()));
+        events.push(...parser.flush());
+        break;
+      }
+
+      events.push(...parser.push(decoder.decode(value, { stream: true })));
+
+      if (events.some((event) => event.event === stopEvent)) {
+        break;
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+
+  return events;
+}
+
+async function waitForCondition(assertion: () => void): Promise<void> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  throw lastError;
 }
 
 test("parses SSE events split across chunks", () => {
@@ -168,7 +222,9 @@ test("session API creates, lists, renames, loads, and deletes sessions", async (
 
   const detail = await app.request(`/api/sessions/${createdBody.session.id}`);
   assert.equal(detail.status, 200);
-  const detailBody = (await detail.json()) as {
+  assert.match(detail.headers.get("content-type") ?? "", /text\/event-stream/);
+  const detailEvents = await readEventsUntil(detail, "session-snapshot");
+  const detailBody = JSON.parse(detailEvents[0]?.data ?? "{}") as {
     session: { id: string; title: string };
     runs: unknown[];
     messages: unknown[];
@@ -221,7 +277,47 @@ test("sessions persist on disk across server instances", async () => {
   ]);
 });
 
-test("POST /api/sessions/:sessionId/runs streams with session memory and persists run state", async () => {
+test("GET /api/sessions/:sessionId streams initial snapshot", async () => {
+  const stateDir = await createTempStateDir();
+  const app = createServer({
+    stateDir,
+    env: {
+      OPENROUTER_API_KEY: "test-key",
+    },
+  });
+
+  const created = await app.request("/api/sessions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ title: "Stream session" }),
+  });
+  assert.equal(created.status, 201);
+  const session = ((await created.json()) as { session: { id: string; title: string } }).session;
+
+  const response = await app.request(`/api/sessions/${session.id}`);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
+
+  const events = await readEventsUntil(response, "session-snapshot");
+  assert.deepEqual(
+    events.map((event) => event.event),
+    ["session-snapshot"],
+  );
+
+  const snapshot = JSON.parse(events[0]?.data ?? "{}") as {
+    session: { id: string; title: string };
+    runs: unknown[];
+    messages: unknown[];
+  };
+  assert.equal(snapshot.session.id, session.id);
+  assert.equal(snapshot.session.title, "Stream session");
+  assert.deepEqual(snapshot.runs, []);
+  assert.deepEqual(snapshot.messages, []);
+});
+
+test("POST /api/sessions/:sessionId/runs returns 204 and publishes run events", async () => {
   const stateDir = await createTempStateDir();
   const chunks = [
     {
@@ -268,6 +364,9 @@ test("POST /api/sessions/:sessionId/runs streams with session memory and persist
   assert.equal(created.status, 201);
   const sessionId = ((await created.json()) as { session: { id: string } }).session.id;
 
+  const stream = await app.request(`/api/sessions/${sessionId}`);
+  assert.equal(stream.status, 200);
+
   const response = await app.request(`/api/sessions/${sessionId}/runs`, {
     method: "POST",
     headers: {
@@ -276,24 +375,31 @@ test("POST /api/sessions/:sessionId/runs streams with session memory and persist
     body: JSON.stringify({ prompt: "Say hello" }),
   });
 
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
+  assert.equal(response.status, 204);
 
-  const events = collectEvents(await response.text());
+  const events = await readEventsUntil(stream, "done");
   assert.deepEqual(
     events.map((event) => event.event),
-    ["run-start", "text-delta", "done"],
+    ["session-snapshot", "run-start", "session-updated", "text-delta", "done"],
   );
 
-  const runStart = JSON.parse(events[0]?.data ?? "{}") as {
+  const runStart = JSON.parse(events[1]?.data ?? "{}") as {
     runId: string;
     sessionId: string;
     model: string;
+    run: {
+      id: string;
+      prompt: string;
+      status: string;
+    };
   };
   assert.match(runStart.runId, /^[a-zA-Z0-9_-]+$/);
   assert.equal(runStart.sessionId, sessionId);
   assert.equal(runStart.model, "openrouter/google/gemini-2.0-flash-lite-001");
-  assert.equal(JSON.parse(events[1]?.data ?? "{}").payload.text, "hello");
+  assert.equal(runStart.run.id, runStart.runId);
+  assert.equal(runStart.run.prompt, "Say hello");
+  assert.equal(runStart.run.status, "running");
+  assert.equal(JSON.parse(events[3]?.data ?? "{}").payload.text, "hello");
   assert.deepEqual(prompts, ["Say hello"]);
   assert.deepEqual(models, ["openrouter/google/gemini-2.0-flash-lite-001"]);
   assert.deepEqual(memoryCalls, [
@@ -304,8 +410,8 @@ test("POST /api/sessions/:sessionId/runs streams with session memory and persist
   ]);
 
   const detail = await app.request(`/api/sessions/${sessionId}`);
-  assert.equal(detail.status, 200);
-  const detailBody = (await detail.json()) as {
+  const detailEvents = await readEventsUntil(detail, "session-snapshot");
+  const detailBody = JSON.parse(detailEvents[0]?.data ?? "{}") as {
     runs: Array<{
       id: string;
       prompt: string;
@@ -327,7 +433,98 @@ test("POST /api/sessions/:sessionId/runs streams with session memory and persist
   );
 });
 
-test("POST /api/runs streams agent chunks as SSE without live model calls", async () => {
+test("PATCH /api/sessions/:sessionId publishes session-updated", async () => {
+  const stateDir = await createTempStateDir();
+  const app = createServer({
+    stateDir,
+    env: {
+      OPENROUTER_API_KEY: "test-key",
+    },
+  });
+
+  const created = await app.request("/api/sessions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ title: "Before rename" }),
+  });
+  const sessionId = ((await created.json()) as { session: { id: string } }).session.id;
+  const stream = await app.request(`/api/sessions/${sessionId}`);
+
+  const renamed = await app.request(`/api/sessions/${sessionId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ title: "After rename" }),
+  });
+  assert.equal(renamed.status, 200);
+
+  const events = await readEventsUntil(stream, "session-updated");
+  assert.deepEqual(
+    events.map((event) => event.event),
+    ["session-snapshot", "session-updated"],
+  );
+  assert.equal(JSON.parse(events[1]?.data ?? "{}").session.title, "After rename");
+});
+
+test("agent errors publish error and persist failed run", async () => {
+  const stateDir = await createTempStateDir();
+  const fakeAgent: ServerAgent = {
+    async stream() {
+      throw new Error("agent failed");
+    },
+  };
+  const app = createServer({
+    stateDir,
+    createAgent() {
+      return fakeAgent;
+    },
+    env: {
+      OPENROUTER_API_KEY: "test-key",
+    },
+  });
+
+  const created = await app.request("/api/sessions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ title: "Error session" }),
+  });
+  const sessionId = ((await created.json()) as { session: { id: string } }).session.id;
+  const stream = await app.request(`/api/sessions/${sessionId}`);
+
+  const response = await app.request(`/api/sessions/${sessionId}/runs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ prompt: "Fail" }),
+  });
+  assert.equal(response.status, 204);
+
+  const events = await readEventsUntil(stream, "error");
+  assert.deepEqual(
+    events.map((event) => event.event),
+    ["session-snapshot", "run-start", "session-updated", "error"],
+  );
+  assert.equal(JSON.parse(events[3]?.data ?? "{}").error, "agent failed");
+
+  const detail = await app.request(`/api/sessions/${sessionId}`);
+  const detailEvents = await readEventsUntil(detail, "session-snapshot");
+  const snapshot = JSON.parse(detailEvents[0]?.data ?? "{}") as {
+    runs: Array<{
+      status: string;
+      error?: string;
+    }>;
+  };
+  assert.equal(snapshot.runs[0]?.status, "error");
+  assert.equal(snapshot.runs[0]?.error, "agent failed");
+});
+
+test("POST /api/runs returns 204 and runs agent without live model calls", async () => {
   const chunks = [
     {
       type: "text-delta",
@@ -368,15 +565,9 @@ test("POST /api/runs streams agent chunks as SSE without live model calls", asyn
     body: JSON.stringify({ prompt: "Say hello" }),
   });
 
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
-
-  const events = collectEvents(await response.text());
-  assert.deepEqual(
-    events.map((event) => event.event),
-    ["run-start", "text-delta", "done"],
-  );
-  assert.equal(JSON.parse(events[1]?.data ?? "{}").payload.text, "hello");
-  assert.deepEqual(prompts, ["Say hello"]);
-  assert.deepEqual(models, ["openrouter/google/gemini-2.0-flash-lite-001"]);
+  assert.equal(response.status, 204);
+  await waitForCondition(() => {
+    assert.deepEqual(prompts, ["Say hello"]);
+    assert.deepEqual(models, ["openrouter/google/gemini-2.0-flash-lite-001"]);
+  });
 });
