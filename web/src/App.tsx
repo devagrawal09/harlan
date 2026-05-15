@@ -257,8 +257,15 @@ function EventLog(props: EventLogProps) {
 }
 
 function EventLogRow(props: { item: DomainLogItem }) {
+  const [collapsed, setCollapsed] = createSignal(true);
   const title = createMemo(() => eventTitle(props.item.name));
   const eventClass = createMemo(() => `event-row event-row-${props.item.name}`);
+  const collapsible = createMemo(
+    () =>
+      props.item.name === domainEventNames.agentExecuted ||
+      props.item.name === domainEventNames.executionCompleted,
+  );
+  const toggleLabel = createMemo(() => (collapsed() ? "Expand" : "Collapse"));
 
   return (
     <li class={eventClass()}>
@@ -266,12 +273,46 @@ function EventLogRow(props: { item: DomainLogItem }) {
         <span>{title()}</span>
         <time>{new Date(props.item.createdAt).toLocaleString()}</time>
       </div>
-      <EventLogContent item={props.item} />
+      <EventToggle
+        collapsed={collapsed()}
+        collapsible={collapsible()}
+        toggleLabel={toggleLabel()}
+        toggleCollapsed={() => setCollapsed((current) => !current)}
+      />
+      <EventLogContent collapsed={collapsible() && collapsed()} item={props.item} />
+      <EventToggle
+        collapsed={collapsed()}
+        collapsible={collapsible()}
+        toggleLabel={toggleLabel()}
+        toggleCollapsed={() => setCollapsed((current) => !current)}
+      />
     </li>
   );
 }
 
-function EventLogContent(props: { item: DomainLogItem }) {
+type EventToggleProps = {
+  collapsed: boolean;
+  collapsible: boolean;
+  toggleLabel: string;
+  toggleCollapsed: () => void;
+};
+
+function EventToggle(props: EventToggleProps) {
+  return (
+    <Show when={props.collapsible}>
+      <button
+        class="event-toggle"
+        type="button"
+        aria-expanded={props.collapsed ? "false" : "true"}
+        onClick={props.toggleCollapsed}
+      >
+        {props.toggleLabel}
+      </button>
+    </Show>
+  );
+}
+
+function EventLogContent(props: { collapsed: boolean; item: DomainLogItem }) {
   const content = createMemo(() => {
     switch (props.item.name) {
       case domainEventNames.sessionStarted:
@@ -311,7 +352,13 @@ function EventLogContent(props: { item: DomainLogItem }) {
     <Show when={content()} keyed>
       {(currentContent) =>
         currentContent.element === "pre" ? (
-          <pre class={currentContent.className}>{currentContent.text}</pre>
+          <pre
+            class={`${currentContent.className} ${
+              props.collapsed ? "event-output-collapsed" : ""
+            }`}
+          >
+            {currentContent.text}
+          </pre>
         ) : (
           <p class={currentContent.className}>{currentContent.text}</p>
         )
