@@ -201,10 +201,12 @@ class Lexer {
         break;
     }
 
+    const hints = hintsForUnexpectedCharacter(consumed);
     throw new ParseError(
       `unexpected character \`${consumed}\``,
       { start, end: this.location() },
       this.source,
+      { hints },
     );
   }
 
@@ -262,7 +264,11 @@ class Lexer {
     }
 
     if (this.isAtEnd()) {
-      throw new ParseError("unterminated string", { start, end: this.location() }, this.source);
+      throw new ParseError("unterminated string", { start, end: this.location() }, this.source, {
+        hints: [
+          'Close strings with a double quote. Supported escapes include `\\n`, `\\r`, `\\t`, `\\"`, and `\\\\`.',
+        ],
+      });
     }
 
     this.advance();
@@ -280,6 +286,9 @@ class Lexer {
         "unterminated string escape",
         { start, end: this.location() },
         this.source,
+        {
+          hints: ['Supported string escapes include `\\n`, `\\r`, `\\t`, `\\"`, and `\\\\`.'],
+        },
       );
     }
 
@@ -356,6 +365,24 @@ class Lexer {
       column: this.column,
     };
   }
+}
+
+function hintsForUnexpectedCharacter(char: string): string[] {
+  if (char === ";") {
+    return ["Harlan expressions do not use semicolons; put each statement on its own line."];
+  }
+
+  if (char === "'") {
+    return ['Strings use double quotes, for example `let name = "README.md"`.'];
+  }
+
+  if (char === "$" || char === "`") {
+    return [
+      'Shell syntax is not Harlan syntax. Import shell and call `shell.run("command")` only when shell execution is needed.',
+    ];
+  }
+
+  return [];
 }
 
 function isAlpha(char: string): boolean {

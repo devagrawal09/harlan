@@ -7,6 +7,7 @@ import {
   ImportError,
   ParseError,
   RuntimeError,
+  formatUnknownError,
   type HarlanValue,
   parseHarlan,
   renderHarlanResult,
@@ -39,6 +40,60 @@ test("parses import calls, bindings, functions, collections, calls, members, and
 
 test("rejects invalid syntax with source diagnostics", () => {
   assert.throws(() => parseHarlan("let = nope"), ParseError);
+});
+
+test("formats parse errors with concise guidance", () => {
+  const formatted = formatThrownError(() => parseHarlan("let = nope"));
+
+  assert.match(formatted, /ParseError/);
+  assert.match(formatted, /\^/);
+  assert.match(formatted, /Hint:/);
+  assert.match(formatted, /let name = expression/);
+});
+
+test("formats lexer errors with concise guidance", () => {
+  const semicolon = formatThrownError(() => parseHarlan('let x = "a";'));
+  assert.match(semicolon, /unexpected character `;`/);
+  assert.match(semicolon, /do not use semicolons/);
+
+  const singleQuote = formatThrownError(() => parseHarlan("let x = 'a'"));
+  assert.match(singleQuote, /unexpected character `'`/);
+  assert.match(singleQuote, /Strings use double quotes/);
+});
+
+test("formats runtime errors with concise guidance", async () => {
+  const missingImport = await formatRejectedError(() => runHarlan('fs.read("README.md")'));
+  assert.match(missingImport, /unknown binding `fs`/);
+  assert.match(missingImport, /let fs = import\("fs"\)/);
+
+  const unknownProperty = await formatRejectedError(() =>
+    runHarlan(`
+      let fs = import("fs")
+      fs.remove("README.md")
+    `),
+  );
+  assert.match(unknownProperty, /unknown property `remove`/);
+  assert.match(unknownProperty, /`read`/);
+  assert.match(unknownProperty, /`search`/);
+  assert.match(unknownProperty, /`glob`/);
+
+  const typeMismatch = await formatRejectedError(() =>
+    runHarlan(`
+      let fs = import("fs")
+      fs.read(123)
+    `),
+  );
+  assert.match(typeMismatch, /expected a String/);
+  assert.match(typeMismatch, /received Number/);
+  assert.match(typeMismatch, /fs\.read\(path: String\)/);
+
+  const pipeline = await formatRejectedError(() => runHarlan('["a", "b"] |> 1'));
+  assert.match(pipeline, /pipeline target is not a function/);
+  assert.match(pipeline, /value \|> module\.function\(args\)/);
+});
+
+test("formats errors without hints exactly as before", () => {
+  assert.equal(new RuntimeError("plain").format(), "RuntimeError: plain");
 });
 
 test("parses script logic expressions and destructuring patterns", () => {
@@ -598,4 +653,24 @@ function assertRecordBooleans(value: HarlanValue, keys: string[]): void {
     assert.equal(field?.kind, "boolean");
     assert.equal(field?.kind === "boolean" ? field.value : false, true);
   }
+}
+
+function formatThrownError(fn: () => unknown): string {
+  try {
+    fn();
+  } catch (error) {
+    return formatUnknownError(error);
+  }
+
+  assert.fail("Expected function to throw");
+}
+
+async function formatRejectedError(fn: () => Promise<unknown>): Promise<string> {
+  try {
+    await fn();
+  } catch (error) {
+    return formatUnknownError(error);
+  }
+
+  assert.fail("Expected promise to reject");
 }

@@ -26,7 +26,7 @@ export type HarlanValue =
   | { kind: "number"; value: number }
   | { kind: "boolean"; value: boolean }
   | { kind: "list"; items: HarlanValue[] }
-  | { kind: "record"; fields: Map<string, HarlanValue> }
+  | { kind: "record"; fields: Map<string, HarlanValue>; moduleName?: string }
   | { kind: "function"; call: HarlanCallable; name?: string };
 
 export type HarlanRunResult = {
@@ -43,6 +43,7 @@ export type RuntimeContext = {
 };
 
 type Scope = Map<string, HarlanValue>;
+const knownModuleNames = new Set(["fs", "text", "format", "shell"]);
 
 export async function runHarlan(
   source: string,
@@ -112,17 +113,26 @@ function createInitialScope(stdlib: Map<string, HarlanModule>): Scope {
               `import expected 1 argument but received ${args.length}`,
               span,
               context.source,
+              {
+                hints: [
+                  'Import modules with exactly one string argument, for example `let fs = import("fs")`.',
+                ],
+              },
             );
           }
 
           const moduleName = args[0]!;
           if (moduleName.kind !== "string") {
-            throw new ImportError("import expected a String module name", span, context.source);
+            throw new ImportError("import expected a String module name", span, context.source, {
+              hints: ['Use a quoted module name, for example `let text = import("text")`.'],
+            });
           }
 
           const module = stdlib.get(moduleName.value);
           if (!module) {
-            throw new ImportError(`unknown module \`${moduleName.value}\``, span, context.source);
+            throw new ImportError(`unknown module \`${moduleName.value}\``, span, context.source, {
+              hints: ["Available modules are `fs`, `text`, `format`, and `shell`."],
+            });
           }
 
           return moduleToRecord(module);
@@ -136,6 +146,7 @@ function moduleToRecord(module: HarlanModule): HarlanValue {
   return {
     kind: "record",
     fields: new Map(module.bindings),
+    moduleName: module.name,
   };
 }
 
@@ -183,6 +194,11 @@ async function evaluateExpression(
           "if condition must be a boolean",
           expression.condition.span,
           context.source,
+          {
+            hints: [
+              'Use an explicit boolean expression, for example `fs.exists("README.md")` or `info.size > 0`.',
+            ],
+          },
         );
       }
 
@@ -203,6 +219,7 @@ async function evaluateExpression(
           `unknown binding \`${expression.name}\``,
           expression.span,
           context.source,
+          { hints: unknownBindingHints(expression.name) },
         );
       }
       return value;
@@ -244,7 +261,9 @@ async function evaluateUnary(
 ): Promise<HarlanValue> {
   const argument = await evaluateExpression(expression.argument, scope, context);
   if (argument.kind !== "boolean") {
-    throw new RuntimeError("not operand must be a boolean", expression.span, context.source);
+    throw new RuntimeError("not operand must be a boolean", expression.span, context.source, {
+      hints: [booleanOperandHint()],
+    });
   }
 
   return { kind: "boolean", value: !argument.value };
@@ -262,6 +281,7 @@ async function evaluateBinary(
         "and left operand must be a boolean",
         expression.left.span,
         context.source,
+        { hints: [booleanOperandHint()] },
       );
     }
     if (!left.value) {
@@ -274,6 +294,7 @@ async function evaluateBinary(
         "and right operand must be a boolean",
         expression.right.span,
         context.source,
+        { hints: [booleanOperandHint()] },
       );
     }
     return { kind: "boolean", value: right.value };
@@ -286,6 +307,7 @@ async function evaluateBinary(
         "or left operand must be a boolean",
         expression.left.span,
         context.source,
+        { hints: [booleanOperandHint()] },
       );
     }
     if (left.value) {
@@ -298,6 +320,7 @@ async function evaluateBinary(
         "or right operand must be a boolean",
         expression.right.span,
         context.source,
+        { hints: [booleanOperandHint()] },
       );
     }
     return { kind: "boolean", value: right.value };
@@ -331,6 +354,11 @@ async function evaluateMember(
       "member access requires a record value",
       expression.span,
       context.source,
+      {
+        hints: [
+          "Use member access on records returned from imports or record expressions, for example `fs.read` or `task.path`.",
+        ],
+      },
     );
   }
 
@@ -340,6 +368,7 @@ async function evaluateMember(
       `unknown property \`${expression.property}\``,
       expression.span,
       context.source,
+      { hints: unknownPropertyHints(object) },
     );
   }
 
@@ -358,6 +387,9 @@ async function evaluateCall(
       "attempted to call a non-function value",
       expression.span,
       context.source,
+      {
+        hints: ["Only imported module functions and functions declared with `fn` can be called."],
+      },
     );
   }
 
@@ -380,7 +412,9 @@ async function evaluatePipeline(
   if (right.kind === "CallExpression") {
     const callee = await evaluateExpression(right.callee, scope, context);
     if (callee.kind !== "function") {
-      throw new RuntimeError("pipeline target is not a function", right.span, context.source);
+      throw new RuntimeError("pipeline target is not a function", right.span, context.source, {
+        hints: [pipelineHint()],
+      });
     }
 
     const args: HarlanValue[] = [piped];
@@ -393,7 +427,9 @@ async function evaluatePipeline(
 
   const callee = await evaluateExpression(right, scope, context);
   if (callee.kind !== "function") {
-    throw new RuntimeError("pipeline target is not a function", right.span, context.source);
+    throw new RuntimeError("pipeline target is not a function", right.span, context.source, {
+      hints: [pipelineHint()],
+    });
   }
 
   return callee.call([piped], context, right.span);
@@ -453,6 +489,7 @@ function resolvePatternBindings(
           "record destructuring requires a record value",
           pattern.span,
           context.source,
+          { hints: ["Destructure records with `let { field } = recordValue`."] },
         );
       }
       return pattern.fields.flatMap((field) =>
@@ -468,6 +505,7 @@ function resolvePatternBindings(
           "list destructuring requires a list value",
           pattern.span,
           context.source,
+          { hints: ["Destructure lists with `let [first, second] = listValue`."] },
         );
       }
       return pattern.items.flatMap((item, index) =>
@@ -534,6 +572,7 @@ function compareValues(
     "comparison operators require both operands to be numbers or both operands to be strings",
     span,
     context.source,
+    { hints: ["Compare values of the same type before using `<`, `<=`, `>`, or `>=`."] },
   );
 }
 
@@ -552,4 +591,37 @@ function applyComparison(
     case ">=":
       return left >= right;
   }
+}
+
+function unknownBindingHints(name: string): string[] {
+  if (knownModuleNames.has(name)) {
+    return [`Import modules before use, for example:\n  let ${name} = import("${name}")`];
+  }
+
+  return [
+    "Bindings are immutable and must be introduced with `let name = expression` or `fn name(...) = expression` before use.",
+  ];
+}
+
+function unknownPropertyHints(value: Extract<HarlanValue, { kind: "record" }>): string[] {
+  const properties = [...value.fields.keys()];
+  if (value.moduleName && properties.length > 0) {
+    return [
+      `Module \`${value.moduleName}\` provides: ${properties.map((name) => `\`${name}\``).join(", ")}.`,
+    ];
+  }
+
+  if (properties.length > 0 && properties.length <= 12) {
+    return [`Available properties are: ${properties.map((name) => `\`${name}\``).join(", ")}.`];
+  }
+
+  return ["Check the field name or return the record itself to inspect its available properties."];
+}
+
+function booleanOperandHint(): string {
+  return 'Boolean operators require Boolean values; compare strings or numbers first, for example `info.kind == "file" and info.size > 0`.';
+}
+
+function pipelineHint(): string {
+  return "Pipeline targets must be functions: `value |> module.function(args)`.";
 }

@@ -88,7 +88,9 @@ async function readJson<T>(response: Response): Promise<T> {
 
   if (!response.ok) {
     const message =
-      typeof data?.error === "string" ? data.error : text || `Request failed with ${response.status}`;
+      typeof data?.error === "string"
+        ? data.error
+        : text || `Request failed with ${response.status}`;
     throw new Error(message);
   }
 
@@ -118,27 +120,25 @@ export default function App() {
   const [mutationError, setMutationError] = createSignal("");
   let nextEventId = 1;
 
-  const [sessionState] = createSignal<SessionsProjection>(
-    async () => {
-      try {
-        const data = await readJson<{ sessions: SessionSummary[] }>(
-          await fetch(`${apiBaseUrl}/api/sessions`),
-        );
-        const loadedSessions =
-          data.sessions.length > 0 ? data.sessions : [await createSessionRequest()];
+  const [sessionState] = createSignal<SessionsProjection>(async () => {
+    try {
+      const data = await readJson<{ sessions: SessionSummary[] }>(
+        await fetch(`${apiBaseUrl}/api/sessions`),
+      );
+      const loadedSessions =
+        data.sessions.length > 0 ? data.sessions : [await createSessionRequest()];
 
-        return {
-          items: loadedSessions,
-          error: "",
-        };
-      } catch (caught) {
-        return {
-          items: [],
-          error: caught instanceof Error ? caught.message : String(caught),
-        };
-      }
-    },
-  );
+      return {
+        items: loadedSessions,
+        error: "",
+      };
+    } catch (caught) {
+      return {
+        items: [],
+        error: caught instanceof Error ? caught.message : String(caught),
+      };
+    }
+  });
 
   const sessions = createMemo(() => sessionState().items);
   const sessionsLoading = createMemo(() => isPending(() => sessionState()));
@@ -146,42 +146,42 @@ export default function App() {
     () => selectedSessionOverride() || sessions()[0]?.id || "",
   );
 
-  const [detail] = createSignal<SessionProjection>(
-    async () => {
-      const sessionId = selectedSessionId();
+  const [detail] = createSignal<SessionProjection>(async () => {
+    const sessionId = selectedSessionId();
 
-      if (!sessionId) {
-        return {
-          session: null,
-          runs: [],
-          messages: [],
-          error: "",
-        };
-      }
+    if (!sessionId) {
+      return {
+        session: null,
+        runs: [],
+        messages: [],
+        error: "",
+      };
+    }
 
-      try {
-        const data = await readJson<Omit<SessionProjection, "error">>(
-          await fetch(`${apiBaseUrl}/api/sessions/${sessionId}`),
-        );
+    try {
+      const data = await readJson<Omit<SessionProjection, "error">>(
+        await fetch(`${apiBaseUrl}/api/sessions/${sessionId}`),
+      );
 
-        return {
-          ...data,
-          error: "",
-        };
-      } catch (caught) {
-        return {
-          session: null,
-          runs: [],
-          messages: [],
-          error: caught instanceof Error ? caught.message : String(caught),
-        };
-      }
-    },
-  );
+      return {
+        ...data,
+        error: "",
+      };
+    } catch (caught) {
+      return {
+        session: null,
+        runs: [],
+        messages: [],
+        error: caught instanceof Error ? caught.message : String(caught),
+      };
+    }
+  });
 
   const runs = createMemo(() => detail().runs);
   const session = createMemo(() => detail().session);
-  const selectedSession = createMemo(() => sessions().find((item) => item.id === selectedSessionId()));
+  const selectedSession = createMemo(() =>
+    sessions().find((item) => item.id === selectedSessionId()),
+  );
   const error = createMemo(() => mutationError() || sessionState().error || detail().error);
   const [draftTitle, setDraftTitle] = createSignal(() => session()?.title ?? "");
 
@@ -257,7 +257,8 @@ export default function App() {
       );
 
       const nextSession =
-        sessions().find((item) => item.id !== current.id) ?? (await createSession("Untitled session"));
+        sessions().find((item) => item.id !== current.id) ??
+        (await createSession("Untitled session"));
 
       setSelectedSessionId(nextSession.id);
       refresh(sessionState);
@@ -364,11 +365,16 @@ export default function App() {
           </button>
         </div>
 
-        <Show when={!sessionsLoading()} fallback={<span class="empty-state">Loading sessions</span>}>
+        <Show
+          when={!sessionsLoading()}
+          fallback={<span class="empty-state">Loading sessions</span>}
+        >
           <ol class="session-list">
             <For each={sessions()}>
               {(item) => (
-                <li class={`session-item ${item.id === selectedSessionId() ? "session-item-active" : ""}`}>
+                <li
+                  class={`session-item ${item.id === selectedSessionId() ? "session-item-active" : ""}`}
+                >
                   <button type="button" onClick={() => void selectSession(item.id)}>
                     <span>{item.title}</span>
                     <time>{new Date(item.updatedAt).toLocaleString()}</time>
@@ -415,13 +421,21 @@ export default function App() {
           <button type="button" onClick={() => void renameSession()} disabled={!session()}>
             Rename
           </button>
-          <button class="secondary-button" type="button" onClick={() => void deleteSession()} disabled={!session()}>
+          <button
+            class="secondary-button"
+            type="button"
+            onClick={() => void deleteSession()}
+            disabled={!session()}
+          >
             Delete
           </button>
         </div>
 
         <section class="history-panel" aria-label="Session history">
-          <Show when={runs().length > 0 || answer()} fallback={<span class="empty-state">No runs yet</span>}>
+          <Show
+            when={runs().length > 0 || answer()}
+            fallback={<span class="empty-state">No runs yet</span>}
+          >
             <ol class="run-list">
               <For each={runs()}>
                 {(item) => (
@@ -459,7 +473,10 @@ export default function App() {
             placeholder="Ask Harlan to inspect the repo, summarize files, or continue this session."
             rows={8}
           />
-          <button type="submit" disabled={!prompt().trim() || !selectedSession() || status() === "running"}>
+          <button
+            type="submit"
+            disabled={!prompt().trim() || !selectedSession() || status() === "running"}
+          >
             {status() === "running" ? "Running" : "Run"}
           </button>
         </form>
@@ -467,7 +484,6 @@ export default function App() {
         <Show when={error()}>
           <pre class="error-output">{error()}</pre>
         </Show>
-
       </section>
 
       <aside class="event-pane" aria-label="Stream events">

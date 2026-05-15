@@ -59,7 +59,9 @@ class Parser {
 
   private letDeclaration(start: SourceSpan): LetDeclaration {
     const pattern = this.bindingPattern();
-    this.consume("equals", "expected `=` after let binding pattern");
+    this.consume("equals", "expected `=` after let binding pattern", [
+      "Use `let name = expression` or destructure with `let { field } = record`.",
+    ]);
     const value = this.expression();
 
     return {
@@ -86,14 +88,18 @@ class Parser {
       } while (this.match("comma"));
     }
 
-    this.consume("rParen", "expected `)` after parameters");
+    this.consume("rParen", "expected `)` after parameters", [
+      "Function declarations use `fn name(param: Type) = expression`.",
+    ]);
 
     let returnType: TypeAnnotation | null = null;
     if (this.match("arrow")) {
       returnType = this.typeAnnotation();
     }
 
-    this.consume("equals", "expected `=` before function body");
+    this.consume("equals", "expected `=` before function body", [
+      "Function declarations use `fn name(param: Type) = expression`.",
+    ]);
     const body = this.expression();
 
     return {
@@ -140,9 +146,13 @@ class Parser {
 
     const start = this.previous().span;
     const condition = this.expression();
-    this.consume("then", "expected `then` after if condition");
+    this.consume("then", "expected `then` after if condition", [
+      "Use `if condition then value else value`.",
+    ]);
     const thenBranch = this.expression();
-    this.consume("else", "expected `else` after then branch");
+    this.consume("else", "expected `else` after then branch", [
+      "Harlan `if` expressions always include both branches: `if condition then value else value`.",
+    ]);
     const elseBranch = this.expression();
 
     return {
@@ -281,7 +291,9 @@ class Parser {
       } while (this.match("comma"));
     }
 
-    const close = this.consume("rParen", "expected `)` after arguments");
+    const close = this.consume("rParen", "expected `)` after arguments", [
+      'Close function calls with `)`, for example `fs.read("README.md")`.',
+    ]);
     return {
       kind: "CallExpression",
       callee,
@@ -336,7 +348,9 @@ class Parser {
 
     if (this.match("lParen")) {
       const expression = this.expression();
-      this.consume("rParen", "expected `)` after expression");
+      this.consume("rParen", "expected `)` after expression", [
+        "Close parenthesized expressions with `)`.",
+      ]);
       return expression;
     }
 
@@ -348,7 +362,9 @@ class Parser {
       return this.recordExpression(this.previous().span);
     }
 
-    throw this.error(this.peek(), "expected expression");
+    throw this.error(this.peek(), "expected expression", [
+      "Expressions can start with a string, number, boolean, null, identifier, list, record, parenthesized expression, or `if`.",
+    ]);
   }
 
   private bindingPattern(): BindingPattern {
@@ -369,7 +385,9 @@ class Parser {
       return this.listPattern(this.previous().span);
     }
 
-    throw this.error(this.peek(), "expected binding pattern");
+    throw this.error(this.peek(), "expected binding pattern", [
+      "A `let` binding needs a name or destructuring pattern, for example `let name = expression`.",
+    ]);
   }
 
   private recordPattern(start: SourceSpan): BindingPattern {
@@ -396,7 +414,9 @@ class Parser {
       } while (this.match("comma"));
     }
 
-    const close = this.consume("rBrace", "expected `}` after record pattern");
+    const close = this.consume("rBrace", "expected `}` after record pattern", [
+      "Close record destructuring patterns with `}`.",
+    ]);
     return {
       kind: "RecordPattern",
       fields,
@@ -413,7 +433,9 @@ class Parser {
       } while (this.match("comma"));
     }
 
-    const close = this.consume("rBracket", "expected `]` after list pattern");
+    const close = this.consume("rBracket", "expected `]` after list pattern", [
+      "Close list destructuring patterns with `]`.",
+    ]);
     return {
       kind: "ListPattern",
       items,
@@ -430,7 +452,9 @@ class Parser {
       } while (this.match("comma"));
     }
 
-    const close = this.consume("rBracket", "expected `]` after list items");
+    const close = this.consume("rBracket", "expected `]` after list items", [
+      "Close list expressions with `]`.",
+    ]);
     return {
       kind: "ListExpression",
       items,
@@ -454,7 +478,9 @@ class Parser {
       } while (this.match("comma"));
     }
 
-    const close = this.consume("rBrace", "expected `}` after record fields");
+    const close = this.consume("rBrace", "expected `}` after record fields", [
+      "Close record expressions with `}`.",
+    ]);
     return {
       kind: "RecordExpression",
       fields,
@@ -473,12 +499,12 @@ class Parser {
     return false;
   }
 
-  private consume(type: TokenType, message: string): Token {
+  private consume(type: TokenType, message: string, hints: string[] = []): Token {
     if (this.check(type)) {
       return this.advance();
     }
 
-    throw this.error(this.peek(), message);
+    throw this.error(this.peek(), message, hints);
   }
 
   private consumeIdentifier(message: string): string {
@@ -513,7 +539,7 @@ class Parser {
     return this.tokens[this.current - 1] ?? this.tokens[0]!;
   }
 
-  private error(token: Token, message: string): ParseError {
-    return new ParseError(message, token.span, this.source);
+  private error(token: Token, message: string, hints: string[] = []): ParseError {
+    return new ParseError(message, token.span, this.source, { hints });
   }
 }

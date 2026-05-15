@@ -11,6 +11,26 @@ import type { SourceSpan } from "./tokens.ts";
 const execFileAsync = promisify(execFile);
 const ignoredDirectoryNames = new Set(["node_modules", ".git", "dist", "build", "coverage"]);
 const searchResultLimit = 200;
+const signaturesByName = new Map<string, string>([
+  ["fs.cwd", "fs.cwd()"],
+  ["fs.read", "fs.read(path: String)"],
+  ["fs.list", "fs.list(path: String)"],
+  ["fs.exists", "fs.exists(path: String)"],
+  ["fs.glob", "fs.glob(pattern: String)"],
+  ["fs.search", "fs.search(path: String, query: String)"],
+  ["fs.info", "fs.info(path: String)"],
+  ["shell.run", "shell.run(command: String)"],
+  ["text.lines", "text.lines(value: String)"],
+  ["text.join", "text.join(items: List, separator: String)"],
+  ["text.take", "text.take(items: List, count: Number)"],
+  ["text.contains", "text.contains(value: String, query: String)"],
+  ["text.trim", "text.trim(value: String)"],
+  ["text.lower", "text.lower(value: String)"],
+  ["text.includes", "text.includes(items: List, query: String)"],
+  ["format.json", "format.json(value)"],
+  ["format.lines", "format.lines(items: List[String])"],
+  ["format.table", "format.table(items: List[Record])"],
+]);
 
 export type HarlanRunOptions = {
   cwd?: string;
@@ -45,6 +65,11 @@ function createFsModule(): HarlanModule {
           `fs.read expected a file path: \`${filePath}\``,
           span,
           context.source,
+          {
+            hints: [
+              "Use `fs.info(path)` to check whether a path is a file or directory before reading.",
+            ],
+          },
         );
       }
 
@@ -148,7 +173,11 @@ function createShellModule(): HarlanModule {
       requireArity("shell.run", args, 1, context, span);
 
       if (!context.options.allowShell) {
-        throw new RuntimeError("shell.run is disabled for this execution", span, context.source);
+        throw new RuntimeError("shell.run is disabled for this execution", span, context.source, {
+          hints: [
+            "Prefer `fs`, `text`, and `format` helpers unless shell execution is explicitly enabled.",
+          ],
+        });
       }
 
       const command = requireString("shell.run", args[0]!, context, span);
@@ -259,7 +288,9 @@ function resolveInsideCwd(inputPath: string, context: RuntimeContext, span: Sour
   const relative = path.relative(cwd, resolved);
 
   if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new RuntimeError(`path escapes the runtime cwd: \`${inputPath}\``, span, context.source);
+    throw new RuntimeError(`path escapes the runtime cwd: \`${inputPath}\``, span, context.source, {
+      hints: ["Use paths relative to the runtime cwd and do not include `..` path traversal."],
+    });
   }
 
   return resolved;
@@ -294,7 +325,9 @@ function assertRelativePath(inputPath: string, context: RuntimeContext, span: So
     inputPath.includes("/../") ||
     path.isAbsolute(inputPath)
   ) {
-    throw new RuntimeError(`path escapes the runtime cwd: \`${inputPath}\``, span, context.source);
+    throw new RuntimeError(`path escapes the runtime cwd: \`${inputPath}\``, span, context.source, {
+      hints: ["Use paths relative to the runtime cwd and do not include `..` path traversal."],
+    });
   }
 }
 
@@ -386,7 +419,11 @@ function searchContent(
 function formatTable(items: HarlanValue[], context: RuntimeContext, span: SourceSpan): string {
   const records = items.map((item) => {
     if (item.kind !== "record") {
-      throw new RuntimeError("format.table expected a List of records", span, context.source);
+      throw new RuntimeError("format.table expected a List of records", span, context.source, {
+        hints: [
+          'Pass records to `format.table`, commonly `fs.search("src", "query").matches |> format.table()`.',
+        ],
+      });
     }
     return item;
   });
@@ -434,6 +471,7 @@ function requireArity(
       `${name} expected ${expected} arguments but received ${args.length}`,
       span,
       context.source,
+      { hints: hintsForFunction(name) },
     );
   }
 }
@@ -445,7 +483,12 @@ function requireString(
   span: SourceSpan,
 ): string {
   if (value.kind !== "string") {
-    throw new RuntimeError(`${name} expected a String`, span, context.source);
+    throw new RuntimeError(
+      `${name} expected a String but received ${formatKind(value)}`,
+      span,
+      context.source,
+      { hints: hintsForFunction(name) },
+    );
   }
 
   return value.value;
@@ -458,7 +501,12 @@ function requireNumber(
   span: SourceSpan,
 ): number {
   if (value.kind !== "number") {
-    throw new RuntimeError(`${name} expected a Number`, span, context.source);
+    throw new RuntimeError(
+      `${name} expected a Number but received ${formatKind(value)}`,
+      span,
+      context.source,
+      { hints: hintsForFunction(name) },
+    );
   }
 
   return value.value;
@@ -471,7 +519,12 @@ function requireList(
   span: SourceSpan,
 ): HarlanValue[] {
   if (value.kind !== "list") {
-    throw new RuntimeError(`${name} expected a List`, span, context.source);
+    throw new RuntimeError(
+      `${name} expected a List but received ${formatKind(value)}`,
+      span,
+      context.source,
+      { hints: hintsForFunction(name) },
+    );
   }
 
   return value.items;
@@ -505,4 +558,36 @@ function runtimeFromUnknown(
 ): RuntimeError {
   const detail = error instanceof Error ? error.message : String(error);
   return new RuntimeError(`${message}: ${detail || EOL}`, span, context.source);
+}
+
+function hintsForFunction(name: string): string[] {
+  const signature = signaturesByName.get(name);
+  const hints = signature ? [`Expected call shape: \`${signature}\`.`] : [];
+
+  if (name === "fs.search") {
+    hints.push(
+      'For bounded results, use `let { matches, truncated } = fs.search("src", "query")`.',
+    );
+  }
+
+  return hints;
+}
+
+function formatKind(value: HarlanValue): string {
+  switch (value.kind) {
+    case "null":
+      return "Null";
+    case "string":
+      return "String";
+    case "number":
+      return "Number";
+    case "boolean":
+      return "Boolean";
+    case "list":
+      return "List";
+    case "record":
+      return "Record";
+    case "function":
+      return "Function";
+  }
 }

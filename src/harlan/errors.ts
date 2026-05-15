@@ -2,22 +2,34 @@ import type { SourceLocation, SourceSpan } from "./tokens.ts";
 
 export type HarlanErrorKind = "ParseError" | "RuntimeError" | "ImportError";
 
+export type HarlanErrorHint = {
+  label?: string;
+  text: string;
+};
+
+export type HarlanErrorOptions = {
+  hints?: Array<string | HarlanErrorHint>;
+};
+
 export class HarlanError extends Error {
   readonly kind: HarlanErrorKind;
   readonly span: SourceSpan | null;
   readonly source: string | null;
+  readonly hints: HarlanErrorHint[];
 
   constructor(
     kind: HarlanErrorKind,
     message: string,
     span?: SourceSpan | null,
     source?: string | null,
+    options: HarlanErrorOptions = {},
   ) {
     super(message);
     this.name = kind;
     this.kind = kind;
     this.span = span ?? null;
     this.source = source ?? null;
+    this.hints = normalizeHints(options.hints ?? []);
   }
 
   format(): string {
@@ -35,25 +47,49 @@ export class HarlanError extends Error {
       }
     }
 
+    if (this.hints.length === 1) {
+      lines.push(`Hint: ${formatHint(this.hints[0]!)}`);
+    } else if (this.hints.length > 1) {
+      lines.push("Hints:");
+      for (const hint of this.hints) {
+        lines.push(`  - ${formatHint(hint).replaceAll("\n", "\n    ")}`);
+      }
+    }
+
     return lines.join("\n");
   }
 }
 
 export class ParseError extends HarlanError {
-  constructor(message: string, span?: SourceSpan | null, source?: string | null) {
-    super("ParseError", message, span, source);
+  constructor(
+    message: string,
+    span?: SourceSpan | null,
+    source?: string | null,
+    options?: HarlanErrorOptions,
+  ) {
+    super("ParseError", message, span, source, options);
   }
 }
 
 export class RuntimeError extends HarlanError {
-  constructor(message: string, span?: SourceSpan | null, source?: string | null) {
-    super("RuntimeError", message, span, source);
+  constructor(
+    message: string,
+    span?: SourceSpan | null,
+    source?: string | null,
+    options?: HarlanErrorOptions,
+  ) {
+    super("RuntimeError", message, span, source, options);
   }
 }
 
 export class ImportError extends HarlanError {
-  constructor(message: string, span?: SourceSpan | null, source?: string | null) {
-    super("ImportError", message, span, source);
+  constructor(
+    message: string,
+    span?: SourceSpan | null,
+    source?: string | null,
+    options?: HarlanErrorOptions,
+  ) {
+    super("ImportError", message, span, source, options);
   }
 }
 
@@ -71,4 +107,12 @@ export function formatUnknownError(error: unknown): string {
 
 export function spanFromLocations(start: SourceLocation, end: SourceLocation): SourceSpan {
   return { start, end };
+}
+
+function normalizeHints(hints: Array<string | HarlanErrorHint>): HarlanErrorHint[] {
+  return hints.map((hint) => (typeof hint === "string" ? { text: hint } : hint));
+}
+
+function formatHint(hint: HarlanErrorHint): string {
+  return hint.label ? `${hint.label}: ${hint.text}` : hint.text;
 }
