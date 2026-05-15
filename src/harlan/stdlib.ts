@@ -10,7 +10,6 @@ import type { HarlanCallable, HarlanValue, RuntimeContext } from "./runtime.ts";
 import type { SourceSpan } from "./tokens.ts";
 
 const execFileAsync = promisify(execFile);
-const ignoredDirectoryNames = new Set(["node_modules", ".git", "dist", "build", "coverage"]);
 const searchResultLimit = 200;
 const signaturesByName = new Map<string, string>([
   ["fs.cwd", "fs.cwd()"],
@@ -130,7 +129,8 @@ function createFsModule(): HarlanModule {
       requireArity("fs.glob", args, 1, context, span);
       const pattern = requireString("fs.glob", args[0]!, context, span);
       assertRelativePath(pattern, context, span);
-      const paths = await listFiles(context.options.cwd);
+      const matcher = await createGitignoreMatcher(context.options.cwd);
+      const paths = await listFiles(context.options.cwd, "", matcher);
       return listValue(
         paths
           .filter((filePath) => matchesGlob(pattern, filePath))
@@ -146,9 +146,19 @@ function createFsModule(): HarlanModule {
       const targetStat = await stat(resolved).catch((error: unknown) => {
         throw runtimeFromUnknown(`unable to search \`${inputPath}\``, error, context, span);
       });
+      const matcher = await createGitignoreMatcher(context.options.cwd);
+      const relativeInputPath = path.relative(context.options.cwd, resolved);
+
+      if (relativeInputPath && matcher.ignores(relativeInputPath, targetStat.isDirectory())) {
+        return recordValue({
+          matches: listValue([]),
+          truncated: booleanValue(false),
+        });
+      }
+
       const relativePaths = targetStat.isDirectory()
-        ? await listFiles(resolved, path.relative(context.options.cwd, resolved))
-        : [path.relative(context.options.cwd, resolved)];
+        ? await listFiles(resolved, relativeInputPath, matcher)
+        : [relativeInputPath];
       const matches: HarlanValue[] = [];
       let truncated = false;
 
@@ -330,20 +340,134 @@ function resolveInsideCwd(inputPath: string, context: RuntimeContext, span: Sour
   return resolved;
 }
 
-async function listFiles(root: string, prefix = ""): Promise<string[]> {
+type GitignoreRule = {
+  pattern: string;
+  negated: boolean;
+  directoryOnly: boolean;
+  anchored: boolean;
+  basenameOnly: boolean;
+};
+
+class GitignoreMatcher {
+  readonly rules: GitignoreRule[];
+
+  constructor(rules: GitignoreRule[]) {
+    this.rules = rules;
+  }
+
+  ignores(relativePath: string, isDirectory: boolean): boolean {
+    const normalizedPath = toPosixPath(relativePath);
+    const pathForDirectory = isDirectory ? `${normalizedPath}/` : normalizedPath;
+    let ignored = false;
+
+    for (const rule of this.rules) {
+      if (matchesGitignoreRule(rule, normalizedPath, pathForDirectory, isDirectory)) {
+        ignored = !rule.negated;
+      }
+    }
+
+    return ignored;
+  }
+}
+
+async function createGitignoreMatcher(cwd: string): Promise<GitignoreMatcher> {
+  const source = await readFile(path.join(cwd, ".gitignore"), "utf8").catch(() => "");
+  const rules = source
+    .split(/\r?\n/)
+    .map(parseGitignoreLine)
+    .filter((rule): rule is GitignoreRule => rule !== null);
+
+  return new GitignoreMatcher(rules);
+}
+
+function parseGitignoreLine(line: string): GitignoreRule | null {
+  const trimmed = line.trim();
+
+  if (!trimmed || trimmed.startsWith("#")) {
+    return null;
+  }
+
+  const negated = trimmed.startsWith("!");
+  const rawPattern = negated ? trimmed.slice(1) : trimmed;
+  const directoryOnly = rawPattern.endsWith("/");
+  const withoutTrailingSlash = directoryOnly ? rawPattern.slice(0, -1) : rawPattern;
+  const anchored = withoutTrailingSlash.startsWith("/");
+  const pattern = anchored ? withoutTrailingSlash.slice(1) : withoutTrailingSlash;
+
+  if (!pattern) {
+    return null;
+  }
+
+  return {
+    pattern: toPosixPath(pattern),
+    negated,
+    directoryOnly,
+    anchored,
+    basenameOnly: !pattern.includes("/"),
+  };
+}
+
+function matchesGitignoreRule(
+  rule: GitignoreRule,
+  normalizedPath: string,
+  pathForDirectory: string,
+  isDirectory: boolean,
+): boolean {
+  if (rule.directoryOnly && !isDirectory) {
+    return false;
+  }
+
+  if (rule.basenameOnly) {
+    return normalizedPath.split("/").some((part) => matchesGlob(rule.pattern, part));
+  }
+
+  if (rule.anchored) {
+    return matchesGitignorePath(rule, normalizedPath, pathForDirectory);
+  }
+
+  const parts = normalizedPath.split("/");
+  for (let index = 0; index < parts.length; index += 1) {
+    const candidate = parts.slice(index).join("/");
+    const candidateDirectory = isDirectory && index === 0 ? pathForDirectory : `${candidate}/`;
+
+    if (matchesGitignorePath(rule, candidate, candidateDirectory)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function matchesGitignorePath(
+  rule: GitignoreRule,
+  normalizedPath: string,
+  pathForDirectory: string,
+): boolean {
+  if (matchesGlob(rule.pattern, normalizedPath)) {
+    return true;
+  }
+
+  return rule.directoryOnly && pathForDirectory.startsWith(`${rule.pattern}/`);
+}
+
+async function listFiles(root: string, prefix = "", matcher: GitignoreMatcher): Promise<string[]> {
   const entries = await readdir(root, { withFileTypes: true });
   const files: string[] = [];
 
   for (const entry of entries) {
-    if (entry.isDirectory() && ignoredDirectoryNames.has(entry.name)) {
-      continue;
-    }
-
     const relativePath = prefix ? path.posix.join(toPosixPath(prefix), entry.name) : entry.name;
     const absolutePath = path.join(root, entry.name);
 
+    if (entry.isDirectory() && entry.name === ".git") {
+      continue;
+    }
+
+    if (matcher.ignores(relativePath, entry.isDirectory())) {
+      continue;
+    }
+
     if (entry.isDirectory()) {
-      files.push(...(await listFiles(absolutePath, relativePath)));
+      files.push(...(await listFiles(absolutePath, relativePath, matcher)));
     } else if (entry.isFile()) {
       files.push(relativePath);
     }

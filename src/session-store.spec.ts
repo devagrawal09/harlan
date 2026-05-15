@@ -36,6 +36,7 @@ describe("SessionStore", () => {
       "text-delta",
       JSON.stringify({ payload: { text: "summary" } }),
     );
+    firstStore.recordRunToolFailure(run.id);
     firstStore.completeRun(run.id);
 
     const secondStore = new SessionStore({ stateDir });
@@ -60,6 +61,7 @@ describe("SessionStore", () => {
     expect(runs[0]).toMatchObject({
       id: run.id,
       answer: "summary",
+      toolFailureCount: 1,
     });
     expect(runs[0]?.events[0]?.event).toBe("text-delta");
   });
@@ -103,6 +105,42 @@ describe("SessionStore", () => {
     const store = new SessionStore({ stateDir });
 
     expect(store.listSessions()).toEqual([]);
+  });
+
+  it("loads old runs without tool failure counts", async () => {
+    const stateDir = await createTempStateDir();
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(
+      join(stateDir, "sessions.json"),
+      `${JSON.stringify({
+        version: 1,
+        sessions: {
+          session: {
+            id: "session",
+            title: "Old session",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+        runs: {
+          run: {
+            id: "run",
+            sessionId: "session",
+            prompt: "Prompt",
+            model: "openrouter/test-model",
+            status: "done",
+            answer: "Answer",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            completedAt: "2026-01-01T00:00:01.000Z",
+            events: [],
+          },
+        },
+      })}\n`,
+    );
+
+    const store = new SessionStore({ stateDir });
+
+    expect(store.listRuns("session")[0]?.toolFailureCount).toBe(0);
   });
 
   it("deleting a session clears Harlan state", async () => {

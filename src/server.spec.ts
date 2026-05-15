@@ -651,6 +651,62 @@ test("tool-result events do not duplicate Harlan executed events", async () => {
   assert.equal(snapshot.events.filter((event) => event.name === "executionCompleted").length, 1);
 });
 
+test("completed runs expose recovered Harlan tool failures", async () => {
+  const stateDir = await createTempStateDir();
+  const app = createServer({
+    stateDir,
+    createAgent() {
+      return {
+        async stream() {
+          return {
+            fullStream: (async function* () {
+              yield {
+                type: "tool-result",
+                payload: {
+                  toolName: "execute_harlan",
+                  result: "RuntimeError: unknown binding `text`",
+                },
+              } as unknown as AgentChunkType;
+              yield {
+                type: "text-delta",
+                payload: { text: "Recovered" },
+              } as AgentChunkType;
+            })(),
+          };
+        },
+      };
+    },
+    env: {
+      OPENROUTER_API_KEY: "test-key",
+    },
+  });
+  const created = await app.request("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "Recovered failure" }),
+  });
+  const sessionId = ((await created.json()) as { session: { id: string } }).session.id;
+  const stream = await app.request(`/api/sessions/${sessionId}`);
+
+  const response = await app.request(`/api/sessions/${sessionId}/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "Recover from tool error" }),
+  });
+  assert.equal(response.status, 204);
+  await readEventsUntil(stream, "agentResponded");
+
+  const detail = await app.request(`/api/sessions/${sessionId}`);
+  const detailEvents = await readEventsUntil(detail, "sessionSnapshot");
+  const snapshot = JSON.parse(detailEvents[0]?.data ?? "{}") as {
+    runs: Array<{ status: string; answer: string; toolFailureCount: number }>;
+  };
+
+  assert.equal(snapshot.runs[0]?.status, "done");
+  assert.equal(snapshot.runs[0]?.answer, "Recovered");
+  assert.equal(snapshot.runs[0]?.toolFailureCount, 1);
+});
+
 test("server execute_harlan persists bindings within a session only", async () => {
   const stateDir = await createTempStateDir();
   const sessionStore = new SessionStore({ stateDir });

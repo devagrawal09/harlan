@@ -176,6 +176,10 @@ function readExecuteHarlanResult(payload: ExecuteHarlanPayload): string | null {
   return payload.result ?? payload.output ?? payload.text ?? payload.content ?? null;
 }
 
+function isHarlanExecutionFailure(result: string): boolean {
+  return /^(ParseError|RuntimeError|ImportError):/.test(result.trimStart());
+}
+
 function createRunMessages(previousMessages: SessionMessage[], prompt: string): MessageListInput {
   return [
     ...previousMessages.map((message) => ({
@@ -565,6 +569,10 @@ export function createServer(options: ServerOptions = {}): Hono {
           }
 
           if (result && chunk.type !== "tool-call" && chunk.type !== "tool-call-delta") {
+            if (isHarlanExecutionFailure(result)) {
+              sessionStore.recordRunToolFailure(runId);
+            }
+
             publishDomainEvent(
               createEventLogItem(domainEventNames.executionCompleted, {
                 session_path: sessionId,

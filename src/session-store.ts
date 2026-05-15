@@ -29,6 +29,7 @@ const runRecordSchema = z.object({
   status: runStatusSchema,
   answer: z.string(),
   error: z.string().optional(),
+  toolFailureCount: z.number().int().min(0).default(0),
   startedAt: z.string().datetime(),
   completedAt: z.string().datetime().optional(),
   events: z.array(
@@ -274,6 +275,7 @@ export class SessionStore {
       model,
       status: "running",
       answer: "",
+      toolFailureCount: 0,
       startedAt: timestamp,
       events: [],
     };
@@ -308,6 +310,17 @@ export class SessionStore {
     }
 
     run.answer += text;
+    this.#save();
+  }
+
+  recordRunToolFailure(runId: string): void {
+    const run = this.#state.runs[runId];
+
+    if (!run) {
+      return;
+    }
+
+    run.toolFailureCount += 1;
     this.#save();
   }
 

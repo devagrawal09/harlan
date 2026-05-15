@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "vitest";
@@ -167,6 +167,48 @@ test("evaluates direct stdlib module calls", async () => {
   );
 
   assert.equal(renderHarlanValue(result.value), "a,b");
+});
+
+test("fs glob and search respect gitignore rules", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "harlan-runtime-"));
+  await writeFile(path.join(cwd, ".gitignore"), "ignored/\n.repos\n*.log\n!.keep.log\n");
+  await writeFile(path.join(cwd, "visible.ts"), "needle\n");
+  await writeFile(path.join(cwd, "debug.log"), "needle\n");
+  await writeFile(path.join(cwd, ".keep.log"), "needle\n");
+  await mkdir(path.join(cwd, "ignored"));
+  await writeFile(path.join(cwd, "ignored", "hidden.ts"), "needle\n");
+  await mkdir(path.join(cwd, ".repos"));
+  await writeFile(path.join(cwd, ".repos", "nested.ts"), "needle\n");
+  await mkdir(path.join(cwd, ".git"));
+  await writeFile(path.join(cwd, ".git", "config"), "needle\n");
+
+  const glob = await runHarlan(
+    `
+      let fs = import("fs")
+      fs.glob("**/*")
+    `,
+    { cwd },
+  );
+  assert.equal(
+    renderHarlanValue(glob.value),
+    '[".gitignore", ".keep.log", "visible.ts"]',
+  );
+
+  const search = await runHarlan(
+    `
+      let fs = import("fs")
+      let format = import("format")
+      fs.search(".", "needle").matches
+        |> format.table()
+    `,
+    { cwd },
+  );
+  assert.match(renderHarlanValue(search.value), /visible\.ts/);
+  assert.match(renderHarlanValue(search.value), /\.keep\.log/);
+  assert.doesNotMatch(renderHarlanValue(search.value), /ignored/);
+  assert.doesNotMatch(renderHarlanValue(search.value), /\.repos/);
+  assert.doesNotMatch(renderHarlanValue(search.value), /\.git/);
+  assert.doesNotMatch(renderHarlanValue(search.value), /debug\.log/);
 });
 
 test("rejects duplicate immutable bindings", async () => {
