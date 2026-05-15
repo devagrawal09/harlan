@@ -24,14 +24,80 @@ body {
 }
 
 button,
+input,
 textarea {
   font: inherit;
 }
 
 .app-shell {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 380px);
+  grid-template-columns: 260px minmax(0, 1fr) minmax(280px, 380px);
   min-height: 100vh;
+}
+
+.session-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border-right: 1px solid #d9ded9;
+  padding: 20px 14px;
+  background: #ffffff;
+}
+
+.session-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.session-list,
+.run-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.session-item {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.session-item button {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: 5px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 10px;
+  color: #22302c;
+  background: transparent;
+  text-align: left;
+}
+
+.session-item button:hover,
+.session-item-active button {
+  border-color: #cbd2ca;
+  background: #eef2ef;
+}
+
+.session-item span {
+  overflow: hidden;
+  color: #22302c;
+  font-size: 14px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
+
+time {
+  color: #66706a;
+  font-size: 12px;
 }
 
 .run-pane {
@@ -57,6 +123,25 @@ p {
 h1 {
   font-size: 24px;
   font-weight: 700;
+}
+
+.session-title {
+  display: grid;
+  gap: 4px;
+}
+
+.session-title input {
+  width: min(560px, 100%);
+  border: 0;
+  padding: 0;
+  color: #18201f;
+  background: transparent;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.session-title input:focus {
+  outline: 3px solid #cce7ed;
 }
 
 h2 {
@@ -126,26 +211,80 @@ button {
   cursor: pointer;
 }
 
+.secondary-button {
+  border: 1px solid #cbd2ca;
+  color: #22302c;
+  background: #ffffff;
+}
+
+.icon-button {
+  display: inline-grid;
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  place-items: center;
+  padding: 0;
+  font-size: 20px;
+}
+
 button:disabled {
   color: #66706a;
   background: #dbe0dc;
   cursor: not-allowed;
 }
 
-.output-panel,
+.session-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.history-panel,
 .error-output {
   border: 1px solid #cbd2ca;
   border-radius: 8px;
   background: #ffffff;
 }
 
-.output-panel {
+.history-panel {
   flex: 1;
   min-height: 260px;
   padding: 18px;
+  overflow: auto;
 }
 
-.output-panel pre,
+.run-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #d4dad4;
+  border-radius: 8px;
+  padding: 14px;
+  background: #ffffff;
+}
+
+.run-card-active {
+  border-color: #2f6f7e;
+}
+
+.run-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.run-card-header span {
+  color: #4f5a55;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.prompt-text {
+  border-left: 3px solid #d9ded9;
+  padding-left: 10px;
+}
+
+.run-card pre,
 .error-output {
   margin: 0;
   white-space: pre-wrap;
@@ -179,7 +318,7 @@ ol {
   list-style: none;
 }
 
-li {
+.event-pane li {
   display: grid;
   gap: 6px;
   border: 1px solid #d4dad4;
@@ -188,7 +327,7 @@ li {
   background: #ffffff;
 }
 
-li span {
+.event-pane li span {
   color: #4f5a55;
   font-size: 12px;
   font-weight: 700;
@@ -207,6 +346,11 @@ code {
 @media (max-width: 760px) {
   .app-shell {
     grid-template-columns: 1fr;
+  }
+
+  .session-pane {
+    border-right: 0;
+    border-bottom: 1px solid #d9ded9;
   }
 
   .run-pane,

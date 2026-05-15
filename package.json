@@ -18,7 +18,7 @@
     "lint:fix": "eslint . --fix",
     "server": "node ./src/server.ts",
     "start": "node ./src/cli.ts",
-    "test": "node --test \"src/**/*.spec.ts\"",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc -p web/tsconfig.json --noEmit"
   },
   "engines": {
@@ -31,11 +31,14 @@
     "eslint": "^10.3.0",
     "prettier": "^3.8.3",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.59.3"
+    "typescript-eslint": "^8.59.3",
+    "vitest": "^4.1.6"
   },
   "dependencies": {
     "@hono/node-server": "^2.0.2",
     "@mastra/core": "^1.33.1",
+    "@mastra/libsql": "^1.10.1",
+    "@mastra/memory": "^1.18.1",
     "@solidjs/web": "^2.0.0-beta.13",
     "dotenv": "^17.4.2",
     "hono": "^4.12.18",
