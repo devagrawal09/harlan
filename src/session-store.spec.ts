@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -62,5 +62,82 @@ describe("SessionStore", () => {
       answer: "summary",
     });
     expect(runs[0]?.events[0]?.event).toBe("text-delta");
+  });
+
+  it("persists Harlan snapshots across reloads", async () => {
+    const stateDir = await createTempStateDir();
+    const firstStore = new SessionStore({ stateDir });
+    const session = firstStore.createSession("Bindings");
+
+    firstStore.updateHarlanSessionSnapshot(session.id, {
+      bindings: {
+        fs: { kind: "module", name: "fs" },
+        answer: { kind: "number", value: 42 },
+      },
+      importedModules: ["fs"],
+    });
+
+    const secondStore = new SessionStore({ stateDir });
+
+    expect(secondStore.getHarlanSessionSnapshot(session.id)).toEqual({
+      bindings: {
+        fs: { kind: "module", name: "fs" },
+        answer: { kind: "number", value: 42 },
+      },
+      importedModules: ["fs"],
+    });
+  });
+
+  it("loads old state files without Harlan session snapshots", async () => {
+    const stateDir = await createTempStateDir();
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(
+      join(stateDir, "sessions.json"),
+      `${JSON.stringify({
+        version: 1,
+        sessions: {},
+        runs: {},
+      })}\n`,
+    );
+
+    const store = new SessionStore({ stateDir });
+
+    expect(store.listSessions()).toEqual([]);
+  });
+
+  it("deleting a session clears Harlan state", async () => {
+    const stateDir = await createTempStateDir();
+    const store = new SessionStore({ stateDir });
+    const session = store.createSession("Delete me");
+
+    store.updateHarlanSessionSnapshot(session.id, {
+      bindings: { fs: { kind: "module", name: "fs" } },
+      importedModules: ["fs"],
+    });
+    store.deleteSession(session.id);
+
+    expect(store.getHarlanSessionSnapshot(session.id)).toEqual({
+      bindings: {},
+      importedModules: [],
+    });
+  });
+
+  it("binding summaries expose names and kinds only", async () => {
+    const stateDir = await createTempStateDir();
+    const store = new SessionStore({ stateDir });
+    const session = store.createSession("Summaries");
+
+    store.updateHarlanSessionSnapshot(session.id, {
+      bindings: {
+        fs: { kind: "module", name: "fs" },
+        secret: { kind: "string", value: "do not expose" },
+      },
+      importedModules: ["fs"],
+    });
+
+    expect(store.getHarlanBindingSummaries(session.id)).toEqual([
+      { name: "fs", kind: "module" },
+      { name: "secret", kind: "string" },
+    ]);
   });
 });

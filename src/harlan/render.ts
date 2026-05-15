@@ -26,8 +26,9 @@ export function renderHarlanResult(
   options: { maxChars?: number } = {},
 ): string {
   const maxChars = options.maxChars ?? 20_000;
+  const warnings = result.warnings.length > 0 ? `${result.warnings.join("\n")}\n` : "";
   const output = result.output.length > 0 ? `${result.output.join("\n")}\n` : "";
-  return truncateRendered(`${output}${renderHarlanValue(result.value)}`, maxChars);
+  return truncateRendered(`${warnings}${output}${renderHarlanValue(result.value)}`, maxChars);
 }
 
 export function harlanValueToJson(value: HarlanValue): unknown {

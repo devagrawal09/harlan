@@ -8,5 +8,18 @@ export {
 } from "./errors.ts";
 export { parseHarlan } from "./parser.ts";
 export { harlanValueToJson, renderHarlanResult, renderHarlanValue } from "./render.ts";
-export { evaluateProgram, runHarlan, type HarlanRunResult, type HarlanValue } from "./runtime.ts";
-export type { HarlanRunOptions } from "./stdlib.ts";
+export {
+  evaluateProgram,
+  getHarlanRunState,
+  runHarlan,
+  summarizeHarlanSessionSnapshot,
+  type HarlanRunResult,
+  type HarlanRunState,
+  type HarlanValue,
+} from "./runtime.ts";
+export type {
+  HarlanBindingSummary,
+  HarlanRunOptions,
+  HarlanSessionSnapshot,
+  SerializedHarlanValue,
+} from "./stdlib.ts";

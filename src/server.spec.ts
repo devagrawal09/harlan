@@ -5,8 +5,9 @@ import { join } from "node:path";
 import type { MessageListInput } from "@mastra/core/agent/message-list";
 import type { AgentChunkType } from "@mastra/core/stream";
 import { onTestFinished, test } from "vitest";
-import { defaultModel } from "./agent.ts";
+import { createSessionExecuteHarlanTool, defaultModel } from "./agent.ts";
 import { createServer, type ServerAgent } from "./server.ts";
+import { SessionStore } from "./session-store.ts";
 import { SseEventParser, parseSseEvent, type SseEvent } from "../web/src/events.ts";
 
 async function createTempStateDir() {
@@ -580,6 +581,239 @@ test("POST /api/sessions/:sessionId/runs publishes Harlan execution events", asy
   assert.equal(snapshot.events[3]?.data.result, "/tmp/project");
 });
 
+test("tool-result events do not duplicate Harlan executed events", async () => {
+  const stateDir = await createTempStateDir();
+  const chunks = [
+    {
+      type: "tool-call",
+      payload: {
+        toolName: "execute_harlan",
+        args: { code: "fs.cwd()" },
+      },
+    } as unknown as AgentChunkType,
+    {
+      type: "tool-result",
+      payload: {
+        toolName: "execute_harlan",
+        args: { code: "fs.cwd()" },
+        result: "/tmp/project",
+      },
+    } as unknown as AgentChunkType,
+  ];
+  const app = createServer({
+    stateDir,
+    createAgent() {
+      return {
+        async stream() {
+          return {
+            fullStream: (async function* () {
+              yield* chunks;
+            })(),
+          };
+        },
+      };
+    },
+    env: {
+      OPENROUTER_API_KEY: "test-key",
+    },
+  });
+  const created = await app.request("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "No duplicate tool events" }),
+  });
+  const sessionId = ((await created.json()) as { session: { id: string } }).session.id;
+  const stream = await app.request(`/api/sessions/${sessionId}`);
+
+  const response = await app.request(`/api/sessions/${sessionId}/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "Run Harlan" }),
+  });
+  assert.equal(response.status, 204);
+
+  const liveEvents = await readEventsUntil(stream, "executionCompleted");
+  assert.equal(
+    liveEvents.filter((event) => event.event === "agentExecuted").length,
+    1,
+  );
+  assert.equal(
+    liveEvents.filter((event) => event.event === "executionCompleted").length,
+    1,
+  );
+
+  const detail = await app.request(`/api/sessions/${sessionId}`);
+  const detailEvents = await readEventsUntil(detail, "sessionSnapshot");
+  const snapshot = JSON.parse(detailEvents[0]?.data ?? "{}") as {
+    events: Array<{ name: string }>;
+  };
+  assert.equal(snapshot.events.filter((event) => event.name === "agentExecuted").length, 1);
+  assert.equal(snapshot.events.filter((event) => event.name === "executionCompleted").length, 1);
+});
+
+test("server execute_harlan persists bindings within a session only", async () => {
+  const stateDir = await createTempStateDir();
+  const sessionStore = new SessionStore({ stateDir });
+  const app = createServer({
+    sessionStore,
+    createAgent(_model, { sessionId }) {
+      return createToolBackedAgent(sessionStore, sessionId);
+    },
+    env: {
+      OPENROUTER_API_KEY: "test-key",
+    },
+  });
+
+  const first = await app.request("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "First" }),
+  });
+  const second = await app.request("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "Second" }),
+  });
+  const firstSessionId = ((await first.json()) as { session: { id: string } }).session.id;
+  const secondSessionId = ((await second.json()) as { session: { id: string } }).session.id;
+
+  assert.equal(await runPrompt(app, firstSessionId, 'let fs = import("fs")'), 204);
+  await waitForCondition(() => {
+    assert.deepEqual(sessionStore.getHarlanBindingSummaries(firstSessionId), [
+      { name: "fs", kind: "module" },
+    ]);
+  });
+  assert.equal(await runPrompt(app, firstSessionId, "fs.cwd()"), 204);
+
+  assert.equal(await runPrompt(app, secondSessionId, "fs.cwd()"), 204);
+
+  await waitForCondition(() => {
+    const secondRun = sessionStore.listRuns(secondSessionId)[0];
+    assert.equal(
+      secondRun?.events.some((event) => event.data.includes("unknown binding `fs`")),
+      true,
+    );
+    assert.deepEqual(sessionStore.getHarlanBindingSummaries(secondSessionId), []);
+  });
+});
+
+test("POST /api/sessions/:sessionId/runs rejects overlapping runs", async () => {
+  const stateDir = await createTempStateDir();
+  let releaseRun: () => void = () => undefined;
+  const fakeAgent: ServerAgent = {
+    async stream() {
+      return {
+        fullStream: (async function* () {
+          await new Promise<void>((resolve) => {
+            releaseRun = resolve;
+          });
+          yield {
+            type: "text-delta",
+            payload: { text: "done" },
+          } as AgentChunkType;
+        })(),
+      };
+    },
+  };
+  const app = createServer({
+    stateDir,
+    createAgent() {
+      return fakeAgent;
+    },
+    env: {
+      OPENROUTER_API_KEY: "test-key",
+    },
+  });
+  const created = await app.request("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "Overlap" }),
+  });
+  const sessionId = ((await created.json()) as { session: { id: string } }).session.id;
+
+  const first = await app.request(`/api/sessions/${sessionId}/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "First" }),
+  });
+  assert.equal(first.status, 204);
+
+  const second = await app.request(`/api/sessions/${sessionId}/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "Second" }),
+  });
+  assert.equal(second.status, 409);
+
+  releaseRun();
+  await waitForCondition(() => {
+    const runs = new SessionStore({ stateDir }).listRuns(sessionId);
+    assert.equal(runs[0]?.status, "done");
+  });
+});
+
+test("session snapshots and updates expose binding summaries without values", async () => {
+  const stateDir = await createTempStateDir();
+  const sessionStore = new SessionStore({ stateDir });
+  const session = sessionStore.createSession("Bindings");
+  sessionStore.updateHarlanSessionSnapshot(session.id, {
+    bindings: {
+      secret: { kind: "string", value: "hidden" },
+      fs: { kind: "module", name: "fs" },
+    },
+    importedModules: ["fs"],
+  });
+  const app = createServer({
+    sessionStore,
+    createAgent() {
+      return {
+        async stream() {
+          return {
+            fullStream: (async function* () {
+              yield {
+                type: "text-delta",
+                payload: { text: "done" },
+              } as AgentChunkType;
+            })(),
+          };
+        },
+      };
+    },
+    env: {
+      OPENROUTER_API_KEY: "test-key",
+    },
+  });
+
+  const detail = await app.request(`/api/sessions/${session.id}`);
+  const detailEvents = await readEventsUntil(detail, "sessionSnapshot");
+  const snapshot = JSON.parse(detailEvents[0]?.data ?? "{}") as {
+    harlanBindings: Array<{ name: string; kind: string; value?: string }>;
+  };
+  assert.deepEqual(snapshot.harlanBindings, [
+    { name: "fs", kind: "module" },
+    { name: "secret", kind: "string" },
+  ]);
+  assert.equal(JSON.stringify(snapshot.harlanBindings).includes("hidden"), false);
+
+  const stream = await app.request(`/api/sessions/${session.id}`);
+  const response = await app.request(`/api/sessions/${session.id}/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "Update" }),
+  });
+  assert.equal(response.status, 204);
+
+  const events = await readEventsUntil(stream, "sessionUpdated");
+  const updated = JSON.parse(events.at(-1)?.data ?? "{}") as {
+    harlanBindings: Array<{ name: string; kind: string; value?: string }>;
+  };
+  assert.deepEqual(updated.harlanBindings, [
+    { name: "fs", kind: "module" },
+    { name: "secret", kind: "string" },
+  ]);
+  assert.equal(JSON.stringify(updated.harlanBindings).includes("hidden"), false);
+});
+
 test("PATCH /api/sessions/:sessionId publishes session-updated", async () => {
   const stateDir = await createTempStateDir();
   const app = createServer({
@@ -718,3 +952,52 @@ test("POST /api/runs returns 204 and runs agent without live model calls", async
     assert.deepEqual(models, [defaultModel]);
   });
 });
+
+function createToolBackedAgent(sessionStore: SessionStore, sessionId: string): ServerAgent {
+  return {
+    async stream(messages) {
+      const lastMessage = Array.isArray(messages) ? messages.at(-1) : null;
+      const code = typeof lastMessage?.content === "string" ? lastMessage.content : "";
+      const tool = createSessionExecuteHarlanTool({ sessionId, sessionStore });
+
+      return {
+        fullStream: (async function* () {
+          yield {
+            type: "tool-call",
+            payload: {
+              toolName: "execute_harlan",
+              args: { code },
+            },
+          } as unknown as AgentChunkType;
+          const result = await (
+            tool.execute as unknown as (input: { code: string }) => Promise<string>
+          )({ code });
+          yield {
+            type: "tool-result",
+            payload: {
+              toolName: "execute_harlan",
+              result,
+            },
+          } as unknown as AgentChunkType;
+          yield {
+            type: "text-delta",
+            payload: { text: result },
+          } as AgentChunkType;
+        })(),
+      };
+    },
+  };
+}
+
+async function runPrompt(
+  app: ReturnType<typeof createServer>,
+  sessionId: string,
+  prompt: string,
+): Promise<number> {
+  const response = await app.request(`/api/sessions/${sessionId}/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt }),
+  });
+  return response.status;
+}

@@ -3,6 +3,7 @@ import { access, readdir, readFile, stat } from "node:fs/promises";
 import { EOL } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import type { FunctionDeclaration } from "./ast.ts";
 import { RuntimeError } from "./errors.ts";
 import { harlanValueToJson, renderHarlanValue } from "./render.ts";
 import type { HarlanCallable, HarlanValue, RuntimeContext } from "./runtime.ts";
@@ -37,6 +38,34 @@ export type HarlanRunOptions = {
   env?: NodeJS.ProcessEnv;
   allowShell?: boolean;
   maxOutputChars?: number;
+  sessionSnapshot?: HarlanSessionSnapshot;
+  maxSessionStateChars?: number;
+};
+
+export type SerializedHarlanValue =
+  | { kind: "null" }
+  | { kind: "string"; value: string }
+  | { kind: "number"; value: number }
+  | { kind: "boolean"; value: boolean }
+  | { kind: "list"; items: SerializedHarlanValue[] }
+  | { kind: "record"; fields: Record<string, SerializedHarlanValue> }
+  | { kind: "module"; name: string }
+  | { kind: "stdlibFunction"; name: string }
+  | {
+      kind: "function";
+      name: string;
+      declaration: FunctionDeclaration;
+      closure: Record<string, SerializedHarlanValue>;
+    };
+
+export type HarlanSessionSnapshot = {
+  bindings: Record<string, SerializedHarlanValue>;
+  importedModules: string[];
+};
+
+export type HarlanBindingSummary = {
+  name: string;
+  kind: "null" | "string" | "number" | "boolean" | "list" | "record" | "module" | "function";
 };
 
 export type HarlanModule = {
@@ -276,7 +305,12 @@ function moduleFromBindings(name: string, bindings: Record<string, HarlanCallabl
     bindings: new Map(
       Object.entries(bindings).map(([bindingName, call]) => [
         bindingName,
-        { kind: "function", name: `${name}.${bindingName}`, call },
+        {
+          kind: "function",
+          name: `${name}.${bindingName}`,
+          stdlibName: `${name}.${bindingName}`,
+          call,
+        },
       ]),
     ),
   };

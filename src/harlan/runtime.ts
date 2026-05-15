@@ -11,7 +11,14 @@ import type {
 } from "./ast.ts";
 import { ImportError, RuntimeError } from "./errors.ts";
 import { parseHarlan } from "./parser.ts";
-import { createStdlib, type HarlanModule, type HarlanRunOptions } from "./stdlib.ts";
+import {
+  createStdlib,
+  type HarlanBindingSummary,
+  type HarlanModule,
+  type HarlanRunOptions,
+  type HarlanSessionSnapshot,
+  type SerializedHarlanValue,
+} from "./stdlib.ts";
 import type { SourceSpan } from "./tokens.ts";
 
 export type HarlanCallable = (
@@ -27,23 +34,42 @@ export type HarlanValue =
   | { kind: "boolean"; value: boolean }
   | { kind: "list"; items: HarlanValue[] }
   | { kind: "record"; fields: Map<string, HarlanValue>; moduleName?: string }
-  | { kind: "function"; call: HarlanCallable; name?: string };
+  | {
+      kind: "function";
+      call: HarlanCallable;
+      name?: string;
+      stdlibName?: string;
+      declaration?: FunctionDeclaration;
+      closure?: Map<string, HarlanValue>;
+    };
 
 export type HarlanRunResult = {
   value: HarlanValue;
   output: string[];
+  sessionSnapshot: HarlanSessionSnapshot;
+  warnings: string[];
 };
 
 export type RuntimeContext = {
   source: string;
   options: Required<Pick<HarlanRunOptions, "cwd" | "allowShell" | "maxOutputChars">> & {
     env: NodeJS.ProcessEnv;
+    maxSessionStateChars: number | null;
   };
   output: string[];
+  stdlib: Map<string, HarlanModule>;
+  warnings: string[];
 };
 
 type Scope = Map<string, HarlanValue>;
 const knownModuleNames = new Set(["fs", "text", "format", "shell"]);
+const defaultSessionSnapshot: HarlanSessionSnapshot = { bindings: {}, importedModules: [] };
+const runStateSymbol = Symbol("harlanRunState");
+
+export type HarlanRunState = {
+  sessionSnapshot: HarlanSessionSnapshot;
+  warnings: string[];
+};
 
 export async function runHarlan(
   source: string,
@@ -58,6 +84,7 @@ export async function evaluateProgram(
   source: string,
   options: HarlanRunOptions = {},
 ): Promise<HarlanRunResult> {
+  const stdlib = createStdlib();
   const context: RuntimeContext = {
     source,
     options: {
@@ -65,18 +92,53 @@ export async function evaluateProgram(
       env: options.env ?? process.env,
       allowShell: options.allowShell ?? false,
       maxOutputChars: options.maxOutputChars ?? 20_000,
+      maxSessionStateChars: options.maxSessionStateChars ?? null,
     },
     output: [],
+    stdlib,
+    warnings: [],
   };
-  const stdlib = createStdlib();
-  const scope: Scope = createInitialScope(stdlib);
+  const initialScope = createInitialScope(stdlib);
+  const scope: Scope = restoreSessionSnapshot(options.sessionSnapshot, initialScope, stdlib);
   let value: HarlanValue = { kind: "null" };
+  let sessionSnapshot = snapshotFromScope(scope, initialScope);
 
   for (const statement of program.statements) {
-    value = await evaluateStatement(statement, scope, context);
+    const before = new Map(scope);
+    try {
+      value = await evaluateStatement(statement, scope, context);
+      const nextSnapshot = snapshotFromScope(scope, initialScope);
+      assertSnapshotSize(nextSnapshot, context, statement.span);
+      sessionSnapshot = nextSnapshot;
+    } catch (error) {
+      replaceScope(scope, before);
+      attachRunState(error, sessionSnapshot, context.warnings);
+      throw error;
+    }
   }
 
-  return { value, output: context.output };
+  return {
+    value,
+    output: context.output,
+    sessionSnapshot,
+    warnings: context.warnings,
+  };
+}
+
+export function getHarlanRunState(error: unknown): HarlanRunState | null {
+  if (!error || typeof error !== "object") {
+    return null;
+  }
+
+  return (error as { [runStateSymbol]?: HarlanRunState })[runStateSymbol] ?? null;
+}
+
+export function summarizeHarlanSessionSnapshot(
+  snapshot: HarlanSessionSnapshot = defaultSessionSnapshot,
+): HarlanBindingSummary[] {
+  return Object.entries(snapshot.bindings)
+    .map(([name, value]) => ({ name, kind: summarizeSerializedKind(value) }))
+    .sort((left, right) => left.name.localeCompare(right.name));
 }
 
 async function evaluateStatement(
@@ -86,6 +148,11 @@ async function evaluateStatement(
 ): Promise<HarlanValue> {
   switch (statement.kind) {
     case "LetDeclaration": {
+      const duplicateImport = maybeHandleDuplicateImport(statement, scope, context);
+      if (duplicateImport) {
+        return duplicateImport;
+      }
+
       const value = await evaluateExpression(statement.value, scope, context);
       bindPattern(statement.pattern, value, scope, context);
       return value;
@@ -107,6 +174,7 @@ function createInitialScope(stdlib: Map<string, HarlanModule>): Scope {
       {
         kind: "function",
         name: "import",
+        stdlibName: "import",
         call: (args, context, span) => {
           if (args.length !== 1) {
             throw new ImportError(
@@ -151,9 +219,12 @@ function moduleToRecord(module: HarlanModule): HarlanValue {
 }
 
 function createUserFunction(declaration: FunctionDeclaration, parentScope: Scope): HarlanValue {
+  const frozenScope = new Map(parentScope);
   return {
     kind: "function",
     name: declaration.name,
+    declaration,
+    closure: frozenScope,
     call: async (args, context, span) => {
       if (args.length !== declaration.params.length) {
         throw new RuntimeError(
@@ -163,7 +234,7 @@ function createUserFunction(declaration: FunctionDeclaration, parentScope: Scope
         );
       }
 
-      const localScope = new Map(parentScope);
+      const localScope = new Map(frozenScope);
       declaration.params.forEach((param, index) => {
         localScope.set(param.name, args[index]!);
       });
@@ -171,6 +242,308 @@ function createUserFunction(declaration: FunctionDeclaration, parentScope: Scope
       return evaluateExpression(declaration.body, localScope, context);
     },
   };
+}
+
+function restoreSessionSnapshot(
+  snapshot: HarlanSessionSnapshot | undefined,
+  initialScope: Scope,
+  stdlib: Map<string, HarlanModule>,
+): Scope {
+  const scope = new Map(initialScope);
+
+  for (const [name, value] of Object.entries(snapshot?.bindings ?? {})) {
+    scope.set(name, deserializeHarlanValue(value, initialScope, stdlib));
+  }
+
+  return scope;
+}
+
+function snapshotFromScope(scope: Scope, initialScope: Scope): HarlanSessionSnapshot {
+  const bindings: Record<string, SerializedHarlanValue> = {};
+  const importedModules = new Set<string>();
+
+  for (const [name, value] of scope) {
+    if (initialScope.has(name)) {
+      continue;
+    }
+
+    bindings[name] = serializeHarlanValue(value, initialScope);
+    collectImportedModules(value, importedModules);
+  }
+
+  return {
+    bindings,
+    importedModules: [...importedModules].sort(),
+  };
+}
+
+function serializeHarlanValue(value: HarlanValue, initialScope: Scope): SerializedHarlanValue {
+  switch (value.kind) {
+    case "null":
+      return { kind: "null" };
+    case "string":
+      return { kind: "string", value: value.value };
+    case "number":
+      return { kind: "number", value: value.value };
+    case "boolean":
+      return { kind: "boolean", value: value.value };
+    case "list":
+      return {
+        kind: "list",
+        items: value.items.map((item) => serializeHarlanValue(item, initialScope)),
+      };
+    case "record":
+      if (value.moduleName) {
+        return { kind: "module", name: value.moduleName };
+      }
+
+      return {
+        kind: "record",
+        fields: Object.fromEntries(
+          [...value.fields.entries()].map(([name, fieldValue]) => [
+            name,
+            serializeHarlanValue(fieldValue, initialScope),
+          ]),
+        ),
+      };
+    case "function":
+      if (value.stdlibName) {
+        return { kind: "stdlibFunction", name: value.stdlibName };
+      }
+
+      if (value.declaration && value.closure) {
+        return {
+          kind: "function",
+          name: value.name ?? value.declaration.name,
+          declaration: value.declaration,
+          closure: Object.fromEntries(
+            [...value.closure.entries()].map(([name, closureValue]) => [
+              name,
+              serializeHarlanValue(closureValue, initialScope),
+            ]),
+          ),
+        };
+      }
+
+      throw new RuntimeError(`cannot persist function \`${value.name ?? "anonymous"}\``);
+  }
+}
+
+function deserializeHarlanValue(
+  value: SerializedHarlanValue,
+  initialScope: Scope,
+  stdlib: Map<string, HarlanModule>,
+): HarlanValue {
+  switch (value.kind) {
+    case "null":
+      return { kind: "null" };
+    case "string":
+      return { kind: "string", value: value.value };
+    case "number":
+      return { kind: "number", value: value.value };
+    case "boolean":
+      return { kind: "boolean", value: value.value };
+    case "list":
+      return {
+        kind: "list",
+        items: value.items.map((item) => deserializeHarlanValue(item, initialScope, stdlib)),
+      };
+    case "record":
+      return {
+        kind: "record",
+        fields: new Map(
+          Object.entries(value.fields).map(([name, fieldValue]) => [
+            name,
+            deserializeHarlanValue(fieldValue, initialScope, stdlib),
+          ]),
+        ),
+      };
+    case "module": {
+      const module = stdlib.get(value.name);
+      if (!module) {
+        throw new RuntimeError(`cannot restore unknown module \`${value.name}\``);
+      }
+      return moduleToRecord(module);
+    }
+    case "stdlibFunction": {
+      const restored = findStdlibFunction(value.name, initialScope, stdlib);
+      if (!restored) {
+        throw new RuntimeError(`cannot restore unknown stdlib function \`${value.name}\``);
+      }
+      return restored;
+    }
+    case "function": {
+      const closure = new Map(
+        Object.entries(value.closure).map(([name, closureValue]) => [
+          name,
+          deserializeHarlanValue(closureValue, initialScope, stdlib),
+        ]),
+      );
+      return createUserFunctionFromClosure(value.declaration, closure, value.name);
+    }
+  }
+}
+
+function findStdlibFunction(
+  name: string,
+  initialScope: Scope,
+  stdlib: Map<string, HarlanModule>,
+): HarlanValue | null {
+  if (name === "import") {
+    return initialScope.get("import") ?? null;
+  }
+
+  const [moduleName, bindingName] = name.split(".");
+  if (!moduleName || !bindingName) {
+    return null;
+  }
+
+  return stdlib.get(moduleName)?.bindings.get(bindingName) ?? null;
+}
+
+function createUserFunctionFromClosure(
+  declaration: FunctionDeclaration,
+  frozenScope: Scope,
+  name: string,
+): HarlanValue {
+  return {
+    kind: "function",
+    name,
+    declaration,
+    closure: frozenScope,
+    call: async (args, context, span) => {
+      if (args.length !== declaration.params.length) {
+        throw new RuntimeError(
+          `function \`${declaration.name}\` expected ${declaration.params.length} arguments but received ${args.length}`,
+          span,
+          context.source,
+        );
+      }
+
+      const localScope = new Map(frozenScope);
+      declaration.params.forEach((param, index) => {
+        localScope.set(param.name, args[index]!);
+      });
+
+      return evaluateExpression(declaration.body, localScope, context);
+    },
+  };
+}
+
+function collectImportedModules(value: HarlanValue, importedModules: Set<string>): void {
+  switch (value.kind) {
+    case "record":
+      if (value.moduleName) {
+        importedModules.add(value.moduleName);
+        return;
+      }
+      for (const fieldValue of value.fields.values()) {
+        collectImportedModules(fieldValue, importedModules);
+      }
+      return;
+    case "list":
+      for (const item of value.items) {
+        collectImportedModules(item, importedModules);
+      }
+      return;
+    case "function":
+      for (const closureValue of value.closure?.values() ?? []) {
+        collectImportedModules(closureValue, importedModules);
+      }
+      return;
+    case "null":
+    case "string":
+    case "number":
+    case "boolean":
+      return;
+  }
+}
+
+function maybeHandleDuplicateImport(
+  statement: Statement,
+  scope: Scope,
+  context: RuntimeContext,
+): HarlanValue | null {
+  if (
+    statement.kind !== "LetDeclaration" ||
+    statement.pattern.kind !== "IdentifierPattern" ||
+    statement.value.kind !== "CallExpression" ||
+    statement.value.callee.kind !== "IdentifierExpression" ||
+    statement.value.callee.name !== "import" ||
+    statement.value.args.length !== 1 ||
+    statement.value.args[0]?.kind !== "StringLiteral"
+  ) {
+    return null;
+  }
+
+  const name = statement.pattern.name;
+  const moduleName = statement.value.args[0].value;
+  const existing = scope.get(name);
+  if (!existing) {
+    return null;
+  }
+
+  if (existing.kind === "record" && existing.moduleName === moduleName && name === moduleName) {
+    context.warnings.push(
+      `Warning: ${name} is already imported in this session; use ${name} directly in later scripts.`,
+    );
+    return existing;
+  }
+
+  return null;
+}
+
+function assertSnapshotSize(
+  snapshot: HarlanSessionSnapshot,
+  context: RuntimeContext,
+  span: SourceSpan,
+): void {
+  if (context.options.maxSessionStateChars === null) {
+    return;
+  }
+
+  const size = JSON.stringify(snapshot).length;
+  if (size > context.options.maxSessionStateChars) {
+    throw new RuntimeError(
+      `persisted Harlan session state exceeds ${context.options.maxSessionStateChars} characters`,
+      span,
+      context.source,
+    );
+  }
+}
+
+function replaceScope(scope: Scope, replacement: Scope): void {
+  scope.clear();
+  for (const [name, value] of replacement) {
+    scope.set(name, value);
+  }
+}
+
+function attachRunState(
+  error: unknown,
+  sessionSnapshot: HarlanSessionSnapshot,
+  warnings: string[],
+): void {
+  if (!error || typeof error !== "object") {
+    return;
+  }
+
+  (error as { [runStateSymbol]?: HarlanRunState })[runStateSymbol] = {
+    sessionSnapshot,
+    warnings: [...warnings],
+  };
+}
+
+function summarizeSerializedKind(value: SerializedHarlanValue): HarlanBindingSummary["kind"] {
+  switch (value.kind) {
+    case "module":
+      return "module";
+    case "stdlibFunction":
+    case "function":
+      return "function";
+    default:
+      return value.kind;
+  }
 }
 
 async function evaluateExpression(

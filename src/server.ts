@@ -16,7 +16,12 @@ import {
   type DomainEventPayloadMap,
   type EventLogItem,
 } from "../events.ts";
-import { assertProviderConfig, createHarlanAgent, defaultModel } from "./agent.ts";
+import {
+  assertProviderConfig,
+  createHarlanAgent,
+  createSessionExecuteHarlanTool,
+  defaultModel,
+} from "./agent.ts";
 import { SessionStore, type RunRecord, type SessionMessage } from "./session-store.ts";
 
 type AgentStream = {
@@ -66,7 +71,7 @@ export type ServerAgent = {
 };
 
 export type ServerOptions = {
-  createAgent?: (model: string) => ServerAgent;
+  createAgent?: (model: string, context: { sessionId: string }) => ServerAgent;
   env?: NodeJS.ProcessEnv;
   sessionStore?: SessionStore;
   stateDir?: string;
@@ -97,6 +102,7 @@ type SessionSnapshotPayload = {
   runs: RunRecord[];
   messages: ReturnType<SessionStore["listMessages"]>;
   events: EventLogItem[];
+  harlanBindings: ReturnType<SessionStore["getHarlanBindingSummaries"]>;
 };
 
 type ExecuteHarlanPayload = {
@@ -207,7 +213,7 @@ function projectRunToDomainEvents(run: RunRecord): EventLogItem[] {
     const code = readExecuteHarlanCode(payload);
     const result = readExecuteHarlanResult(payload);
 
-    if (code) {
+    if (code && event.event === "tool-call") {
       events.push(
         createEventLogItem(
           domainEventNames.agentExecuted,
@@ -255,10 +261,23 @@ function projectRunToDomainEvents(run: RunRecord): EventLogItem[] {
 
 export function createServer(options: ServerOptions = {}): Hono {
   const sessionStore = options.sessionStore ?? new SessionStore({ stateDir: options.stateDir });
-  const createAgent =
-    options.createAgent ?? ((model: string) => createHarlanAgent(model) as ServerAgent);
   const env = options.env ?? process.env;
   const sessionEvents = new SessionEventHub();
+  const createAgent =
+    options.createAgent ??
+    ((model: string, { sessionId }: { sessionId: string }) =>
+      createHarlanAgent(model, {
+        executeHarlanTool: createSessionExecuteHarlanTool({
+          sessionId,
+          sessionStore,
+          onBindingsChanged: (harlanBindings) => {
+            sessionEvents.publish(sessionId, "sessionUpdated", {
+              session: sessionStore.getSession(sessionId),
+              harlanBindings,
+            });
+          },
+        }),
+      }) as ServerAgent);
   const app = new Hono();
 
   app.use(
@@ -365,7 +384,10 @@ export function createServer(options: ServerOptions = {}): Hono {
       return c.json({ error: "Session not found." }, 404);
     }
 
-    sessionEvents.publish(sessionId, "sessionUpdated", { session });
+    sessionEvents.publish(sessionId, "sessionUpdated", {
+      session,
+      harlanBindings: sessionStore.getHarlanBindingSummaries(sessionId),
+    });
 
     return c.json({ session });
   });
@@ -419,6 +441,10 @@ export function createServer(options: ServerOptions = {}): Hono {
       return c.json({ error: "Session not found." }, 404);
     }
 
+    if (sessionStore.hasRunningRun(sessionId)) {
+      return c.json({ error: "Session already has a running run." }, 409);
+    }
+
     const model = parsed.data.model ?? defaultModel;
 
     try {
@@ -427,7 +453,7 @@ export function createServer(options: ServerOptions = {}): Hono {
       return c.json({ error: toErrorMessage(error) }, 500);
     }
 
-    const agent = createAgent(model);
+    const agent = createAgent(model, { sessionId });
     const previousMessages = sessionStore.listMessages(sessionId);
     const run = sessionStore.createRun(sessionId, prompt, model);
     const userMessaged = createEventLogItem(domainEventNames.userMessaged, {
@@ -444,6 +470,7 @@ export function createServer(options: ServerOptions = {}): Hono {
     publishDomainEvent(userMessaged);
     sessionEvents.publish(sessionId, "sessionUpdated", {
       session: sessionStore.getSession(sessionId),
+      harlanBindings: sessionStore.getHarlanBindingSummaries(sessionId),
     });
     void runAgent({ agent, previousMessages, prompt, runId: run.id, sessionId });
 
@@ -472,6 +499,7 @@ export function createServer(options: ServerOptions = {}): Hono {
       runs,
       messages: sessionStore.listMessages(sessionId),
       events,
+      harlanBindings: sessionStore.getHarlanBindingSummaries(sessionId),
     };
   }
 
@@ -527,7 +555,7 @@ export function createServer(options: ServerOptions = {}): Hono {
           const code = readExecuteHarlanCode(executeHarlanPayload);
           const result = readExecuteHarlanResult(executeHarlanPayload);
 
-          if (code) {
+          if (code && chunk.type === "tool-call") {
             publishDomainEvent(
               createEventLogItem(domainEventNames.agentExecuted, {
                 session_path: sessionId,
@@ -563,6 +591,7 @@ export function createServer(options: ServerOptions = {}): Hono {
       sessionEvents.publish(sessionId, "runDone", { ok: true, runId, sessionId, run });
       sessionEvents.publish(sessionId, "sessionUpdated", {
         session: sessionStore.getSession(sessionId),
+        harlanBindings: sessionStore.getHarlanBindingSummaries(sessionId),
       });
     } catch (error) {
       const message = toErrorMessage(error);
@@ -572,6 +601,7 @@ export function createServer(options: ServerOptions = {}): Hono {
       sessionEvents.publish(sessionId, "runError", { error: message, runId, sessionId, run });
       sessionEvents.publish(sessionId, "sessionUpdated", {
         session: sessionStore.getSession(sessionId),
+        harlanBindings: sessionStore.getHarlanBindingSummaries(sessionId),
       });
     }
   }

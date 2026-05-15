@@ -24,19 +24,27 @@ type SessionDetail = SessionSummary & {
   resourceId: string;
 };
 
+type HarlanBindingSummary = {
+  name: string;
+  kind: "null" | "string" | "number" | "boolean" | "list" | "record" | "module" | "function";
+};
+
 type SessionProjection = {
   session: SessionDetail | null;
   events: DomainLogItem[];
+  harlanBindings: HarlanBindingSummary[];
   streamError: string;
 };
 
 type SessionSnapshot = {
   session: SessionDetail | null;
   events: DomainLogItem[];
+  harlanBindings: HarlanBindingSummary[];
 };
 
 type SessionUpdatedPayload = {
   session: SessionDetail | null;
+  harlanBindings?: HarlanBindingSummary[];
 };
 
 type RunErrorPayload = {
@@ -133,6 +141,7 @@ function emptySessionProjection(): SessionProjection {
   return {
     session: null,
     events: [],
+    harlanBindings: [],
     streamError: "",
   };
 }
@@ -545,6 +554,7 @@ export default function App() {
         const payload = readEventPayload<SessionSnapshot>(parsedEvent);
         draft.session = payload.session;
         draft.events = payload.events;
+        draft.harlanBindings = payload.harlanBindings;
         draft.streamError = "";
         continue;
       }
@@ -552,6 +562,9 @@ export default function App() {
       if (parsedEvent.event === "sessionUpdated") {
         const payload = readEventPayload<SessionUpdatedPayload>(parsedEvent);
         draft.session = payload.session;
+        if (payload.harlanBindings) {
+          draft.harlanBindings = payload.harlanBindings;
+        }
         refresh(sessions);
         continue;
       }
@@ -559,6 +572,7 @@ export default function App() {
       if (parsedEvent.event === "sessionDeleted") {
         draft.session = null;
         draft.events = [];
+        draft.harlanBindings = [];
         draft.streamError = "";
         refresh(sessions);
         continue;

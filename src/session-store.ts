@@ -2,6 +2,12 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import z from "zod";
+import {
+  summarizeHarlanSessionSnapshot,
+  type HarlanBindingSummary,
+  type HarlanSessionSnapshot,
+  type SerializedHarlanValue,
+} from "./harlan/index.ts";
 
 export const HARLAN_RESOURCE_ID = "harlan-workspace";
 
@@ -34,10 +40,16 @@ const runRecordSchema = z.object({
   ),
 });
 
+const harlanSessionSnapshotSchema = z.object({
+  bindings: z.record(z.string(), z.custom<SerializedHarlanValue>()),
+  importedModules: z.array(z.string()),
+});
+
 const persistedStateSchema = z.object({
   version: z.literal(1),
   sessions: z.record(z.string(), sessionSummarySchema),
   runs: z.record(z.string(), runRecordSchema),
+  harlanSessions: z.record(z.string(), harlanSessionSnapshotSchema).default({}),
 });
 
 export type RunStatus = z.infer<typeof runStatusSchema>;
@@ -72,6 +84,7 @@ function emptyState(): PersistedState {
     version: 1,
     sessions: {},
     runs: {},
+    harlanSessions: {},
   };
 }
 
@@ -187,6 +200,7 @@ export class SessionStore {
     }
 
     delete this.#state.sessions[sessionId];
+    delete this.#state.harlanSessions[sessionId];
 
     for (const [runId, run] of Object.entries(this.#state.runs)) {
       if (run.sessionId === sessionId) {
@@ -202,6 +216,23 @@ export class SessionStore {
     return Object.values(this.#state.runs).some(
       (run) => run.sessionId === sessionId && run.status === "running",
     );
+  }
+
+  getHarlanSessionSnapshot(sessionId: string): HarlanSessionSnapshot {
+    return this.#state.harlanSessions[sessionId] ?? { bindings: {}, importedModules: [] };
+  }
+
+  updateHarlanSessionSnapshot(sessionId: string, snapshot: HarlanSessionSnapshot): void {
+    if (!this.#state.sessions[sessionId]) {
+      return;
+    }
+
+    this.#state.harlanSessions[sessionId] = snapshot;
+    this.#save();
+  }
+
+  getHarlanBindingSummaries(sessionId: string): HarlanBindingSummary[] {
+    return summarizeHarlanSessionSnapshot(this.getHarlanSessionSnapshot(sessionId));
   }
 
   listRuns(sessionId: string): RunRecord[] {

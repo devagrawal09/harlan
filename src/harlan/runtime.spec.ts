@@ -8,6 +8,7 @@ import {
   ParseError,
   RuntimeError,
   formatUnknownError,
+  getHarlanRunState,
   type HarlanValue,
   parseHarlan,
   renderHarlanResult,
@@ -587,6 +588,8 @@ test("renderHarlanResult includes output, value, and truncation", () => {
   const rendered = renderHarlanResult({
     output: ["side effect"],
     value: { kind: "string", value: "final value" },
+    sessionSnapshot: { bindings: {}, importedModules: [] },
+    warnings: [],
   });
   assert.equal(rendered, "side effect\nfinal value");
 
@@ -594,10 +597,102 @@ test("renderHarlanResult includes output, value, and truncation", () => {
     {
       output: [],
       value: { kind: "string", value: "abcdefghij" },
+      sessionSnapshot: { bindings: {}, importedModules: [] },
+      warnings: [],
     },
     { maxChars: 4 },
   );
   assert.equal(truncated, "abcd\n... truncated after 4 characters");
+});
+
+test("persists imported modules across run snapshots", async () => {
+  const first = await runHarlan('let fs = import("fs")', { cwd: process.cwd() });
+  const second = await runHarlan("fs.cwd()", {
+    cwd: process.cwd(),
+    sessionSnapshot: first.sessionSnapshot,
+  });
+
+  assert.equal(renderHarlanValue(second.value), process.cwd());
+  assert.deepEqual(second.sessionSnapshot.importedModules, ["fs"]);
+});
+
+test("persists top-level values across run snapshots", async () => {
+  const first = await runHarlan('let answer = "forty two"');
+  const second = await runHarlan("answer", { sessionSnapshot: first.sessionSnapshot });
+
+  assert.equal(renderHarlanValue(second.value), "forty two");
+});
+
+test("persists top-level functions with frozen closures", async () => {
+  const first = await runHarlan(`
+    let prefix = "hello"
+    fn greet(name: String) = prefix
+  `);
+  const second = await runHarlan('greet("world")', { sessionSnapshot: first.sessionSnapshot });
+
+  assert.equal(renderHarlanValue(second.value), "hello");
+});
+
+test("persists stdlib function aliases", async () => {
+  const first = await runHarlan(`
+    let fs = import("fs")
+    let cwd = fs.cwd
+  `);
+  const second = await runHarlan("cwd()", {
+    cwd: process.cwd(),
+    sessionSnapshot: first.sessionSnapshot,
+  });
+
+  assert.equal(renderHarlanValue(second.value), process.cwd());
+});
+
+test("warns for duplicate same-module imports but rejects normal duplicates", async () => {
+  const first = await runHarlan('let fs = import("fs")');
+  const duplicateImport = await runHarlan('let fs = import("fs")', {
+    sessionSnapshot: first.sessionSnapshot,
+  });
+
+  assert.deepEqual(duplicateImport.warnings, [
+    "Warning: fs is already imported in this session; use fs directly in later scripts.",
+  ]);
+
+  await assert.rejects(
+    () => runHarlan("let fs = 1", { sessionSnapshot: first.sessionSnapshot }),
+    RuntimeError,
+  );
+});
+
+test("returns partial snapshot for completed statements before runtime failure", async () => {
+  const error = await captureRejectedError(() =>
+    runHarlan(`
+      let keep = "committed"
+      missing.name
+    `),
+  );
+  const runState = getHarlanRunState(error);
+
+  assert.ok(runState);
+  const resumed = await runHarlan("keep", { sessionSnapshot: runState.sessionSnapshot });
+  assert.equal(renderHarlanValue(resumed.value), "committed");
+});
+
+test("state size limit fails oversized binding while keeping earlier commits", async () => {
+  const error = await captureRejectedError(() =>
+    runHarlan(
+      `
+        let keep = "committed"
+        let too_large = "abcdefghijklmnopqrstuvwxyz"
+      `,
+      { maxSessionStateChars: 120 },
+    ),
+  );
+  const runState = getHarlanRunState(error);
+
+  assert.ok(runState);
+  assert.deepEqual(Object.keys(runState.sessionSnapshot.bindings), ["keep"]);
+
+  const resumed = await runHarlan("keep", { sessionSnapshot: runState.sessionSnapshot });
+  assert.equal(renderHarlanValue(resumed.value), "committed");
 });
 
 test("agent usefulness acceptance examples work", async () => {
@@ -670,6 +765,16 @@ async function formatRejectedError(fn: () => Promise<unknown>): Promise<string> 
     await fn();
   } catch (error) {
     return formatUnknownError(error);
+  }
+
+  assert.fail("Expected promise to reject");
+}
+
+async function captureRejectedError(fn: () => Promise<unknown>): Promise<unknown> {
+  try {
+    await fn();
+  } catch (error) {
+    return error;
   }
 
   assert.fail("Expected promise to reject");
