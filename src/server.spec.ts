@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MessageListInput } from "@mastra/core/agent/message-list";
@@ -16,6 +16,24 @@ async function createTempStateDir() {
     await rm(stateDir, { recursive: true, force: true });
   });
   return stateDir;
+}
+
+async function createTempWorkspace() {
+  const workspace = await mkdtemp(join(tmpdir(), "harlan-workspace-"));
+  onTestFinished(async () => {
+    await rm(workspace, { recursive: true, force: true });
+  });
+  return workspace;
+}
+
+async function writeLibraryFile(cwd: string, name: string, source: string): Promise<void> {
+  const filePath = join(cwd, "harlan", name);
+  await mkdir(join(filePath, ".."), { recursive: true });
+  await writeFile(filePath, source);
+}
+
+async function executeHarlanTool(tool: ReturnType<typeof createSessionExecuteHarlanTool>, code: string) {
+  return (tool.execute as unknown as (input: { code: string }) => Promise<string>)({ code });
 }
 
 async function readEventsUntil(response: Response, stopEvent: string): Promise<SseEvent[]> {
@@ -1007,6 +1025,112 @@ test("POST /api/runs returns 204 and runs agent without live model calls", async
     assert.deepEqual(messages, [[{ role: "user", content: "Say hello" }]]);
     assert.deepEqual(models, [defaultModel]);
   });
+});
+
+test("session execute_harlan runs harlan/init.harlan once before first execution", async () => {
+  const cwd = await createTempWorkspace();
+  await writeLibraryFile(
+    cwd,
+    "mymodule/hello.harlan",
+    `
+      fn greet() -> String =
+        "hello"
+    `,
+  );
+  await writeLibraryFile(cwd, "init.harlan", 'import("mymodule.hello")');
+  const stateDir = await createTempStateDir();
+  const sessionStore = new SessionStore({ stateDir });
+  const session = sessionStore.createSession("init");
+  const tool = createSessionExecuteHarlanTool({ sessionId: session.id, sessionStore, cwd });
+
+  const first = await executeHarlanTool(tool, "mymodule.hello.greet()");
+  assert.match(first, /Imported mymodule\.hello:/);
+  assert.match(first, /hello$/);
+
+  await writeLibraryFile(
+    cwd,
+    "init.harlan",
+    `
+      let should_not_run = "again"
+    `,
+  );
+  const second = await executeHarlanTool(tool, "mymodule.hello.greet()");
+  assert.equal(second, "hello");
+
+});
+
+test("session init success snapshot persists across later runs", async () => {
+  const cwd = await createTempWorkspace();
+  await writeLibraryFile(cwd, "init.harlan", 'let initialized = "yes"');
+  const stateDir = await createTempStateDir();
+  const sessionStore = new SessionStore({ stateDir });
+  const session = sessionStore.createSession("init persists");
+  const tool = createSessionExecuteHarlanTool({ sessionId: session.id, sessionStore, cwd });
+
+  assert.equal(await executeHarlanTool(tool, "initialized"), "yes");
+  assert.equal(await executeHarlanTool(tool, "initialized"), "yes");
+
+});
+
+test("session init does not rerun after empty successful init and empty requested run", async () => {
+  const cwd = await createTempWorkspace();
+  await writeLibraryFile(cwd, "init.harlan", '"initialized without bindings"');
+  const stateDir = await createTempStateDir();
+  const sessionStore = new SessionStore({ stateDir });
+  const session = sessionStore.createSession("empty init once");
+  const tool = createSessionExecuteHarlanTool({ sessionId: session.id, sessionStore, cwd });
+
+  assert.equal(await executeHarlanTool(tool, '"first"'), "first");
+
+  await writeLibraryFile(cwd, "init.harlan", 'let rerun = "bad"');
+  const second = await executeHarlanTool(tool, "rerun");
+  assert.match(second, /RuntimeError: unknown binding `rerun`/);
+});
+
+test("session init failure warns and requested code still runs", async () => {
+  const cwd = await createTempWorkspace();
+  await writeLibraryFile(cwd, "init.harlan", "missing.binding");
+  const stateDir = await createTempStateDir();
+  const sessionStore = new SessionStore({ stateDir });
+  const session = sessionStore.createSession("init failure");
+  const tool = createSessionExecuteHarlanTool({ sessionId: session.id, sessionStore, cwd });
+
+  const result = await executeHarlanTool(tool, '"requested"');
+  assert.match(result, /Warning: harlan\/init\.harlan failed/);
+  assert.match(result, /RuntimeError: unknown binding `missing`/);
+  assert.match(result, /requested$/);
+
+});
+
+test("session init read failure warns and requested code still runs", async () => {
+  const cwd = await createTempWorkspace();
+  await mkdir(join(cwd, "harlan", "init.harlan"), { recursive: true });
+  const stateDir = await createTempStateDir();
+  const sessionStore = new SessionStore({ stateDir });
+  const session = sessionStore.createSession("init read failure");
+  const tool = createSessionExecuteHarlanTool({ sessionId: session.id, sessionStore, cwd });
+
+  const result = await executeHarlanTool(tool, '"requested"');
+  assert.match(result, /Warning: harlan\/init\.harlan failed/);
+  assert.match(result, /EISDIR|illegal operation on a directory/);
+  assert.match(result, /requested$/);
+
+});
+
+test("missing init file marks session checked for later runs", async () => {
+  const cwd = await createTempWorkspace();
+  const stateDir = await createTempStateDir();
+  const sessionStore = new SessionStore({ stateDir });
+  const session = sessionStore.createSession("missing init");
+  const tool = createSessionExecuteHarlanTool({ sessionId: session.id, sessionStore, cwd });
+
+  assert.equal(await executeHarlanTool(tool, '"ok"'), "ok");
+  assert.equal(sessionStore.getHarlanSessionSnapshot(session.id).initialized, true);
+
+  await writeLibraryFile(cwd, "init.harlan", 'let late_init = "bad"');
+  const second = await executeHarlanTool(tool, "late_init");
+  assert.match(second, /RuntimeError: unknown binding `late_init`/);
+  assert.equal(sessionStore.getHarlanSessionSnapshot(session.id).initialized, true);
 });
 
 function createToolBackedAgent(sessionStore: SessionStore, sessionId: string): ServerAgent {

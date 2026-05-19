@@ -509,7 +509,7 @@ test("fs.search returns structured matches for directories and files", async () 
   const file = await runHarlan(
     `
       let fs = import("fs")
-      fs.search("src/cli.ts", "execute_harlan")
+      fs.search("src/agent.ts", "execute_harlan")
     `,
     { cwd: process.cwd() },
   );
@@ -645,6 +645,27 @@ test("renderHarlanResult includes output, value, and truncation", () => {
     { maxChars: 4 },
   );
   assert.equal(truncated, "abcd\n... truncated after 4 characters");
+
+  const revealed = renderHarlanResult({
+    output: [],
+    warnings: ["Revealed x.y:\n- f()\n\nfn f() = 1"],
+    value: { kind: "null" },
+    sessionSnapshot: { bindings: {}, importedModules: [] },
+    suppressNullValue: true,
+  });
+  assert.match(revealed, /Revealed x\.y:/);
+  assert.match(revealed, /fn f\(\) = 1/);
+  assert.doesNotMatch(revealed, /\nnull$/);
+
+  assert.equal(
+    renderHarlanResult({
+      output: [],
+      warnings: [],
+      value: { kind: "null" },
+      sessionSnapshot: { bindings: {}, importedModules: [] },
+    }),
+    "null",
+  );
 });
 
 test("persists imported modules across run snapshots", async () => {
@@ -753,7 +774,7 @@ test("agent usefulness acceptance examples work", async () => {
     { cwd: process.cwd() },
   );
   assert.equal(search.value.kind, "string");
-  assert.ok(search.value.kind === "string" && search.value.value.includes("src/cli.ts"));
+  assert.ok(search.value.kind === "string" && search.value.value.includes("src/agent.ts"));
 
   const existence = await runHarlan(
     `
@@ -780,6 +801,249 @@ test("agent usefulness acceptance examples work", async () => {
   );
   assert.equal(glob.value.kind, "string");
   assert.ok(glob.value.kind === "string" && glob.value.value.includes("src/harlan/runtime.ts"));
+});
+
+test("imports user libraries into persistent namespaces with signatures hidden from bodies", async () => {
+  const cwd = await createLibraryWorkspace({
+    "mymodule/hello.harlan": `
+      let secret = "private"
+
+      fn greet(name: String) -> String =
+        name
+    `,
+  });
+
+  const imported = await runHarlan('import("mymodule.hello")', { cwd });
+  assert.match(renderHarlanResult(imported), /Imported mymodule\.hello:/);
+  assert.match(renderHarlanResult(imported), /greet\(name: String\) -> String/);
+  assert.doesNotMatch(renderHarlanResult(imported), /private/);
+
+  const called = await runHarlan('mymodule.hello.greet("Ada")', {
+    cwd,
+    sessionSnapshot: imported.sessionSnapshot,
+  });
+  assert.equal(renderHarlanValue(called.value), "Ada");
+
+  const revealed = await runHarlan("revealImpl(mymodule.hello.greet)", {
+    cwd,
+    sessionSnapshot: imported.sessionSnapshot,
+  });
+  assert.equal(renderHarlanValue(revealed.value), "null");
+  assert.equal(revealed.suppressNullValue, true);
+  assert.match(renderHarlanResult(revealed), /Revealed mymodule\.hello:/);
+  assert.match(renderHarlanResult(revealed), /- greet\(name: String\) -> String/);
+  assert.match(renderHarlanResult(revealed), /fn greet\(name: String\) -> String =/);
+  assert.match(renderHarlanResult(revealed), /name/);
+  assert.doesNotMatch(renderHarlanResult(revealed), /\nnull$/);
+
+  const privateLet = await formatRejectedError(() =>
+    runHarlan("mymodule.hello.secret", { cwd, sessionSnapshot: imported.sessionSnapshot }),
+  );
+  assert.match(privateLet, /unknown property `secret`/);
+});
+
+test("revealImpl rejects stdlib and normal session functions", async () => {
+  const stdlib = await formatRejectedError(() =>
+    runHarlan(`
+      let fs = import("fs")
+      revealImpl(fs.read)
+    `),
+  );
+  assert.match(stdlib, /user-library function/);
+
+  const normal = await formatRejectedError(() =>
+    runHarlan(`
+      fn local() = "x"
+      revealImpl(local)
+    `),
+  );
+  assert.match(normal, /user-library function/);
+});
+
+test("user libraries cannot call revealImpl", async () => {
+  const cwd = await createLibraryWorkspace({
+    "mymodule/bad.harlan": `
+      let bad = revealImpl(mymodule.bad.bad)
+
+      fn value() =
+        "unused"
+    `,
+  });
+
+  const error = await formatRejectedError(() => runHarlan('import("mymodule.bad")', { cwd }));
+  assert.match(error, /unknown binding `revealImpl`/);
+});
+
+test("user libraries can import stdlib modules and other user libraries", async () => {
+  const cwd = await createLibraryWorkspace({
+    "base/value.harlan": `
+      fn value() -> String =
+        "ok"
+    `,
+    "repo/search.harlan": `
+      let text = import("text")
+      import("base.value")
+
+      fn trimmed() -> String =
+        text.trim("  ok  ")
+
+      fn nested() -> String =
+        base.value.value()
+    `,
+  });
+
+  const imported = await runHarlan('import("repo.search")', { cwd });
+  assert.match(imported.warnings.join("\n"), /Imported repo\.search/);
+  assert.doesNotMatch(imported.warnings.join("\n"), /Imported base\.value/);
+
+  const trimmed = await runHarlan("repo.search.trimmed()", {
+    cwd,
+    sessionSnapshot: imported.sessionSnapshot,
+  });
+  const nested = await runHarlan("repo.search.nested()", {
+    cwd,
+    sessionSnapshot: imported.sessionSnapshot,
+  });
+
+  assert.equal(renderHarlanValue(trimmed.value), "ok");
+  assert.equal(renderHarlanValue(nested.value), "ok");
+});
+
+test("private library imports do not leak disclosures when outer import fails", async () => {
+  const cwd = await createLibraryWorkspace({
+    "base/value.harlan": `
+      fn value() -> String =
+        "ok"
+    `,
+    "repo/bad.harlan": `
+      import("base.value")
+      missing.binding
+    `,
+  });
+
+  const error = await captureRejectedError(() => runHarlan('import("repo.bad")', { cwd }));
+  const runState = getHarlanRunState(error);
+
+  assert.ok(runState);
+  assert.doesNotMatch(runState.warnings.join("\n"), /Imported base\.value/);
+  assert.deepEqual(runState.sessionSnapshot.importedModules, []);
+});
+
+test("user library import rejects circular imports and invalid specifiers", async () => {
+  const cwd = await createLibraryWorkspace({
+    "cycle/a.harlan": 'import("cycle.b")',
+    "cycle/b.harlan": 'import("cycle.a")',
+  });
+
+  const circular = await formatRejectedError(() => runHarlan('import("cycle.a")', { cwd }));
+  assert.match(circular, /circular library import/);
+
+  const slash = await formatRejectedError(() => runHarlan('import("mymodule/hello")', { cwd }));
+  assert.match(slash, /dot imports/);
+
+  const traversal = await formatRejectedError(() => runHarlan('import("mymodule..hello")', { cwd }));
+  assert.match(traversal, /invalid user library import specifier/);
+
+  const hyphenated = await formatRejectedError(() => runHarlan('import("my-module.hello")', { cwd }));
+  assert.match(hyphenated, /invalid user library import specifier/);
+});
+
+test("user library imports detect namespace collisions and duplicate imports", async () => {
+  const cwd = await createLibraryWorkspace({
+    "mymodule/hello.harlan": `
+      fn greet() -> String =
+        "hello"
+    `,
+  });
+
+  const collision = await formatRejectedError(() =>
+    runHarlan(
+      `
+        let mymodule = 1
+        import("mymodule.hello")
+      `,
+      { cwd },
+    ),
+  );
+  assert.match(collision, /already exists and is immutable/);
+
+  const first = await runHarlan('import("mymodule.hello")', { cwd });
+  const duplicate = await runHarlan('import("mymodule.hello")', {
+    cwd,
+    sessionSnapshot: first.sessionSnapshot,
+  });
+  assert.match(duplicate.warnings.join("\n"), /already imported/);
+});
+
+test("library module records cannot be reused as intermediate namespaces", async () => {
+  const cwd = await createLibraryWorkspace({
+    "a/b.harlan": `
+      fn value() -> String =
+        "b"
+    `,
+    "a/b/c.harlan": `
+      fn value() -> String =
+        "c"
+    `,
+  });
+
+  const first = await runHarlan('import("a.b")', { cwd });
+  const nested = await formatRejectedError(() =>
+    runHarlan('import("a.b.c")', { cwd, sessionSnapshot: first.sessionSnapshot }),
+  );
+
+  assert.match(nested, /module `a\.b` cannot be used as a namespace/);
+});
+
+test("snapshots restore user library implementations without live reload", async () => {
+  const cwd = await createLibraryWorkspace({
+    "mymodule/hello.harlan": `
+      fn greet() -> String =
+        "old"
+    `,
+  });
+
+  const first = await runHarlan('import("mymodule.hello")', { cwd });
+  await writeFile(
+    path.join(cwd, "harlan", "mymodule", "hello.harlan"),
+    `
+      fn greet() -> String =
+        "new"
+    `,
+  );
+
+  const restored = await runHarlan("mymodule.hello.greet()", {
+    cwd,
+    sessionSnapshot: first.sessionSnapshot,
+  });
+  const source = await runHarlan("revealImpl(mymodule.hello.greet)", {
+    cwd,
+    sessionSnapshot: first.sessionSnapshot,
+  });
+
+  assert.equal(renderHarlanValue(restored.value), "old");
+  assert.equal(renderHarlanValue(source.value), "null");
+  assert.match(renderHarlanResult(source), /"old"/);
+  assert.doesNotMatch(renderHarlanResult(source), /"new"/);
+  assert.doesNotMatch(renderHarlanResult(source), /\nnull$/);
+});
+
+test("library function runtime errors use library source diagnostics after restore", async () => {
+  const cwd = await createLibraryWorkspace({
+    "mymodule/bad.harlan": `
+      fn boom() -> String =
+        missing.binding
+    `,
+  });
+
+  const first = await runHarlan('import("mymodule.bad")', { cwd });
+  const error = await formatRejectedError(() =>
+    runHarlan("mymodule.bad.boom()", { cwd, sessionSnapshot: first.sessionSnapshot }),
+  );
+
+  assert.match(error, /unknown binding `missing`/);
+  assert.match(error, /missing\.binding/);
+  assert.doesNotMatch(error, /mymodule\.bad\.boom\(\)/);
 });
 
 function assertRecordBooleans(value: HarlanValue, keys: string[]): void {
@@ -820,4 +1084,14 @@ async function captureRejectedError(fn: () => Promise<unknown>): Promise<unknown
   }
 
   assert.fail("Expected promise to reject");
+}
+
+async function createLibraryWorkspace(files: Record<string, string>): Promise<string> {
+  const cwd = await mkdtemp(path.join(tmpdir(), "harlan-libs-"));
+  for (const [name, source] of Object.entries(files)) {
+    const filePath = path.join(cwd, "harlan", name);
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, source);
+  }
+  return cwd;
 }

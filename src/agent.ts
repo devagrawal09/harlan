@@ -1,5 +1,7 @@
 import { Agent } from "@mastra/core/agent";
 import { createTool } from "@mastra/core/tools";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import z from "zod";
 import {
   formatUnknownError,
@@ -18,8 +20,8 @@ export const execute_harlan = createTool({
   id: `execute_harlan`,
   description:
     "Execute Harlan code for deterministic tool workflows. Harlan uses `and`/`or`/`not`, named `fn name(...) = expression` functions, and only documented stdlib helpers.",
-  inputSchema: z.object({ code: z.string() }),
-  execute: async ({ code }) => {
+  inputSchema: z.string(),
+  execute: async (code) => {
     try {
       const result = await runHarlan(code, {
         cwd: process.cwd(),
@@ -38,37 +40,45 @@ export function createSessionExecuteHarlanTool({
   sessionId,
   sessionStore,
   onBindingsChanged,
+  cwd = process.cwd(),
 }: {
   sessionId: string;
   sessionStore: SessionStore;
   onBindingsChanged?: (bindings: HarlanBindingSummary[]) => void;
+  cwd?: string;
 }) {
   return createTool({
     id: `execute_harlan`,
     description:
       "Execute Harlan code in this persistent session. Top-level let/fn bindings persist across calls. Reuse existing bindings and import each module only once. Harlan uses `and`/`or`/`not`, named `fn name(...) = expression` functions, and only documented stdlib helpers.",
-    inputSchema: z.object({ code: z.string() }),
-    execute: async ({ code }) => {
+    inputSchema: z.string(),
+    execute: async (code) => {
       const before = sessionStore.getHarlanBindingSummaries(sessionId);
       let snapshot: HarlanSessionSnapshot | undefined;
+      let currentSnapshot = sessionStore.getHarlanSessionSnapshot(sessionId);
+      let initWarning = "";
 
       try {
+        initWarning = await initializeHarlanSessionIfNeeded({ sessionId, sessionStore, cwd });
+        currentSnapshot = sessionStore.getHarlanSessionSnapshot(sessionId);
         const result = await runHarlan(code, {
-          cwd: process.cwd(),
+          cwd,
           env: process.env,
           allowShell: true,
           maxOutputChars: 20_000,
-          sessionSnapshot: sessionStore.getHarlanSessionSnapshot(sessionId),
+          sessionSnapshot: currentSnapshot,
           maxSessionStateChars: 1_000_000,
         });
-        snapshot = result.sessionSnapshot;
-        return renderHarlanResult(result, { maxChars: 20_000 });
+        snapshot = preserveSnapshotMetadata(result.sessionSnapshot, currentSnapshot);
+        return `${initWarning}${renderHarlanResult(result, { maxChars: 20_000 })}`;
       } catch (error) {
         const runState = getHarlanRunState(error);
-        snapshot = runState?.sessionSnapshot;
+        snapshot = runState
+          ? preserveSnapshotMetadata(runState.sessionSnapshot, currentSnapshot)
+          : undefined;
         const warningPrefix =
           runState && runState.warnings.length > 0 ? `${runState.warnings.join("\n")}\n` : "";
-        return `${warningPrefix}${formatUnknownError(error)}`;
+        return `${initWarning}${warningPrefix}${formatUnknownError(error)}`;
       } finally {
         if (snapshot) {
           sessionStore.updateHarlanSessionSnapshot(sessionId, snapshot);
@@ -80,6 +90,73 @@ export function createSessionExecuteHarlanTool({
       }
     },
   });
+}
+
+async function initializeHarlanSessionIfNeeded({
+  sessionId,
+  sessionStore,
+  cwd,
+}: {
+  sessionId: string;
+  sessionStore: SessionStore;
+  cwd: string;
+}): Promise<string> {
+  const snapshot = sessionStore.getHarlanSessionSnapshot(sessionId);
+  if (snapshot.initialized) {
+    return "";
+  }
+
+  if (Object.keys(snapshot.bindings).length > 0) {
+    sessionStore.updateHarlanSessionSnapshot(sessionId, {
+      ...snapshot,
+      initialized: true,
+    });
+    return "";
+  }
+
+  const initPath = path.join(cwd, "harlan", "init.harlan");
+  try {
+    const code = await readFile(initPath, "utf8");
+    const result = await runHarlan(code, {
+      cwd,
+      env: process.env,
+      allowShell: true,
+      maxOutputChars: 20_000,
+      sessionSnapshot: snapshot,
+      maxSessionStateChars: 1_000_000,
+    });
+    sessionStore.updateHarlanSessionSnapshot(sessionId, {
+      ...result.sessionSnapshot,
+      initialized: true,
+    });
+    return result.warnings.length > 0 ? `${result.warnings.join("\n")}\n` : "";
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      sessionStore.updateHarlanSessionSnapshot(sessionId, {
+        ...snapshot,
+        initialized: true,
+      });
+      return "";
+    }
+
+    const runState = getHarlanRunState(error);
+    const warningPrefix =
+      runState && runState.warnings.length > 0 ? `${runState.warnings.join("\n")}\n` : "";
+    return `${warningPrefix}Warning: harlan/init.harlan failed; continuing without init changes.\n${formatUnknownError(error)}\n`;
+  }
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return (
+    error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT"
+  );
+}
+
+function preserveSnapshotMetadata(
+  snapshot: HarlanSessionSnapshot,
+  previous: HarlanSessionSnapshot,
+): HarlanSessionSnapshot {
+  return previous.initialized ? { ...snapshot, initialized: true } : snapshot;
 }
 
 export function createHarlanAgent(
@@ -97,13 +174,17 @@ export function createHarlanAgent(
 
 Harlan is not JavaScript. Do not use JavaScript syntax such as &&, ||, arrow functions, anonymous block functions, semicolons, or helpers that are not documented. Use Harlan boolean operators: and, or, not. Only named top-level functions are supported: fn name(arg: Type) = expression. Do not write anonymous functions like fn (x) { ... }.
 
-Prefer fs.glob and fs.search for codebase inspection before shell.run. Use shell.run only when actual shell behavior is needed. Keep scripts small and return the final useful value. Before writing imports, assume prior top-level bindings may still exist in this session. Import each module once per session with let module = import("module"), then reuse existing bindings in later scripts. If a duplicate-import warning appears, omit that import next time. Use if for existence checks or bounded-result handling. Use destructuring to unpack records returned by stdlib helpers. Use boolean operators instead of nesting conditionals when checking simple predicates. Do not invent helpers like text.filter.
+Prefer fs.glob and fs.search for codebase inspection before shell.run. Use shell.run only when actual shell behavior is needed. Keep scripts small and return the final useful value. Before writing imports, assume prior top-level bindings may still exist in this session. Import stdlib modules once per session with let module = import("module"), then reuse existing bindings in later scripts. Import user libraries with side-effecting dot imports such as import("mymodule.hello"), then call functions through the namespace path, for example mymodule.hello.greet("Ada"). User library imports render function signatures only. Call revealImpl(mymodule.hello.greet) only when you need to inspect a user-library implementation; it reveals the implementation in the tool result and returns no useful value. If a duplicate-import warning appears, omit that import next time and reuse the existing stdlib binding or user-library namespace. Use if for existence checks or bounded-result handling. Use destructuring to unpack records returned by stdlib helpers. Use boolean operators instead of nesting conditionals when checking simple predicates. Do not invent helpers like text.filter.
 
 Available modules and helpers:
 - fs: cwd, read, list, exists, glob, search, info
 - text: lines, join, take, contains, trim, lower, includes
 - format: json, lines, table
 - shell: run
+
+User libraries live under harlan/ and use dot imports:
+import("mymodule.hello")
+mymodule.hello.greet("Ada")
 
 Example: read README
 let fs = import("fs")

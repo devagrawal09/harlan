@@ -10,6 +10,13 @@ import type {
   UnaryExpression,
 } from "./ast.ts";
 import { ImportError, RuntimeError } from "./errors.ts";
+import {
+  functionSignature,
+  functionSource,
+  isUserLibrarySpecifier,
+  parseLibraryModule,
+  validateUserLibrarySpecifier,
+} from "./libraries.ts";
 import { parseHarlan } from "./parser.ts";
 import {
   createStdlib,
@@ -20,6 +27,7 @@ import {
   type SerializedHarlanValue,
 } from "./stdlib.ts";
 import type { SourceSpan } from "./tokens.ts";
+import path from "node:path";
 
 export type HarlanCallable = (
   args: HarlanValue[],
@@ -33,7 +41,14 @@ export type HarlanValue =
   | { kind: "number"; value: number }
   | { kind: "boolean"; value: boolean }
   | { kind: "list"; items: HarlanValue[] }
-  | { kind: "record"; fields: Map<string, HarlanValue>; moduleName?: string }
+  | {
+      kind: "record";
+      fields: Map<string, HarlanValue>;
+      moduleName?: string;
+      namespaceName?: string;
+      libraryModuleName?: string;
+      signatures?: string[];
+    }
   | {
       kind: "function";
       call: HarlanCallable;
@@ -41,6 +56,13 @@ export type HarlanValue =
       stdlibName?: string;
       declaration?: FunctionDeclaration;
       closure?: Map<string, HarlanValue>;
+      library?: {
+        moduleName: string;
+        functionName: string;
+        signature: string;
+        source: string;
+        moduleSource: string;
+      };
     };
 
 export type HarlanRunResult = {
@@ -48,6 +70,7 @@ export type HarlanRunResult = {
   output: string[];
   sessionSnapshot: HarlanSessionSnapshot;
   warnings: string[];
+  suppressNullValue?: boolean;
 };
 
 export type RuntimeContext = {
@@ -55,10 +78,15 @@ export type RuntimeContext = {
   options: Required<Pick<HarlanRunOptions, "cwd" | "allowShell" | "maxOutputChars">> & {
     env: NodeJS.ProcessEnv;
     maxSessionStateChars: number | null;
+    libraryRoot: string;
+    enableUserLibraries: boolean;
   };
   output: string[];
   stdlib: Map<string, HarlanModule>;
   warnings: string[];
+  scope: Scope;
+  activeLibraryLoads: Set<string>;
+  suppressNullValue: boolean;
 };
 
 type Scope = Map<string, HarlanValue>;
@@ -93,19 +121,26 @@ export async function evaluateProgram(
       allowShell: options.allowShell ?? false,
       maxOutputChars: options.maxOutputChars ?? 20_000,
       maxSessionStateChars: options.maxSessionStateChars ?? null,
+      libraryRoot: options.libraryRoot ?? path.join(options.cwd ?? process.cwd(), "harlan"),
+      enableUserLibraries: options.enableUserLibraries ?? true,
     },
     output: [],
     stdlib,
     warnings: [],
+    scope: new Map(),
+    activeLibraryLoads: new Set(),
+    suppressNullValue: false,
   };
   const initialScope = createInitialScope(stdlib);
   const scope: Scope = restoreSessionSnapshot(options.sessionSnapshot, initialScope, stdlib);
+  context.scope = scope;
   let value: HarlanValue = { kind: "null" };
   let sessionSnapshot = snapshotFromScope(scope, initialScope);
 
   for (const statement of program.statements) {
     const before = new Map(scope);
     try {
+      context.suppressNullValue = false;
       value = await evaluateStatement(statement, scope, context);
       const nextSnapshot = snapshotFromScope(scope, initialScope);
       assertSnapshotSize(nextSnapshot, context, statement.span);
@@ -122,6 +157,7 @@ export async function evaluateProgram(
     output: context.output,
     sessionSnapshot,
     warnings: context.warnings,
+    suppressNullValue: context.suppressNullValue,
   };
 }
 
@@ -167,8 +203,11 @@ async function evaluateStatement(
   }
 }
 
-function createInitialScope(stdlib: Map<string, HarlanModule>): Scope {
-  return new Map([
+function createInitialScope(
+  stdlib: Map<string, HarlanModule>,
+  options: { includeRevealImpl?: boolean } = {},
+): Scope {
+  const scope: Scope = new Map([
     [
       "import",
       {
@@ -197,17 +236,77 @@ function createInitialScope(stdlib: Map<string, HarlanModule>): Scope {
           }
 
           const module = stdlib.get(moduleName.value);
-          if (!module) {
-            throw new ImportError(`unknown module \`${moduleName.value}\``, span, context.source, {
-              hints: ["Available modules are `fs`, `text`, `format`, and `shell`."],
-            });
+          if (module) {
+            return moduleToRecord(module);
           }
 
-          return moduleToRecord(module);
+          if (isUserLibrarySpecifier(moduleName.value)) {
+            if (!context.options.enableUserLibraries) {
+              throw new ImportError(
+                `user library imports are disabled: \`${moduleName.value}\``,
+                span,
+                context.source,
+              );
+            }
+            return importUserLibrary(moduleName.value, context, span);
+          }
+
+          if (moduleName.value.includes("/") || moduleName.value.includes("\\")) {
+            throw new ImportError(
+              `unknown module \`${moduleName.value}\`; user libraries use dot imports, not slash paths`,
+              span,
+              context.source,
+              {
+                hints: [
+                  "Available stdlib modules are `fs`, `text`, `format`, and `shell`.",
+                  'Use user library dot imports such as `import("mymodule.hello")`.',
+                ],
+              },
+            );
+          }
+
+          throw new ImportError(`unknown module \`${moduleName.value}\``, span, context.source, {
+            hints: [
+              "Available stdlib modules are `fs`, `text`, `format`, and `shell`.",
+              'Use user library dot imports such as `import("mymodule.hello")`.',
+            ],
+          });
         },
       },
     ],
   ]);
+
+  if (options.includeRevealImpl !== false) {
+    scope.set("revealImpl", {
+      kind: "function",
+      name: "revealImpl",
+      stdlibName: "revealImpl",
+      call: (args, context, span) => {
+        if (args.length !== 1) {
+          throw new RuntimeError(
+            `revealImpl expected 1 argument but received ${args.length}`,
+            span,
+            context.source,
+          );
+        }
+
+        const value = args[0]!;
+        if (value.kind !== "function" || !value.library) {
+          throw new RuntimeError(
+            "revealImpl expects a user-library function value",
+            span,
+            context.source,
+          );
+        }
+
+        context.warnings.push(renderLibraryRevealDisclosure(value.library));
+        context.suppressNullValue = true;
+        return { kind: "null" };
+      },
+    });
+  }
+
+  return scope;
 }
 
 function moduleToRecord(module: HarlanModule): HarlanValue {
@@ -216,6 +315,253 @@ function moduleToRecord(module: HarlanModule): HarlanValue {
     fields: new Map(module.bindings),
     moduleName: module.name,
   };
+}
+
+async function importUserLibrary(
+  moduleName: string,
+  context: RuntimeContext,
+  span: SourceSpan,
+): Promise<HarlanValue> {
+  const parts = validateUserLibrarySpecifier(moduleName, span, context.source);
+  const existing = findLibraryModule(context.scope, parts);
+  if (existing) {
+    context.warnings.push(
+      `Warning: ${moduleName} is already imported in this session; use ${moduleName} directly in later scripts.`,
+    );
+    return existing;
+  }
+
+  assertLibraryNamespaceAvailable(context.scope, parts, context, span);
+  const moduleRecord = await loadUserLibrary(moduleName, context, span);
+  bindLibraryModule(context.scope, parts, moduleRecord, context, span);
+  const signatures = moduleRecord.kind === "record" ? (moduleRecord.signatures ?? []) : [];
+  context.warnings.push(renderLibraryImportDisclosure(moduleName, signatures));
+  return moduleRecord;
+}
+
+async function loadUserLibrary(
+  moduleName: string,
+  context: RuntimeContext,
+  span: SourceSpan,
+): Promise<HarlanValue> {
+  if (context.activeLibraryLoads.has(moduleName)) {
+    throw new RuntimeError("circular library import", span, context.source);
+  }
+
+  context.activeLibraryLoads.add(moduleName);
+  const previousScope = context.scope;
+  const previousSource = context.source;
+  const previousWarningCount = context.warnings.length;
+
+  try {
+    const parsed = await parseLibraryModule(
+      moduleName,
+      context.options.libraryRoot,
+      span,
+      context.source,
+    );
+    const initialScope = createInitialScope(context.stdlib, { includeRevealImpl: false });
+    const moduleScope = new Map(initialScope);
+    context.scope = moduleScope;
+    context.source = parsed.source;
+
+    for (const statement of parsed.program.statements) {
+      await evaluateStatement(statement, moduleScope, context);
+    }
+
+    const fields = new Map<string, HarlanValue>();
+    const signatures: string[] = [];
+    for (const declaration of parsed.functions) {
+      const existing = moduleScope.get(declaration.name);
+      if (!existing || existing.kind !== "function" || !existing.declaration || !existing.closure) {
+        continue;
+      }
+
+      const signature = functionSignature(declaration);
+      signatures.push(signature);
+      fields.set(
+        declaration.name,
+        createUserFunctionFromClosure(declaration, existing.closure, `${moduleName}.${signature}`, {
+          moduleName,
+          functionName: declaration.name,
+          signature,
+          source: functionSource(parsed.source, declaration),
+          moduleSource: parsed.source,
+        }),
+      );
+    }
+
+    return {
+      kind: "record",
+      fields,
+      libraryModuleName: moduleName,
+      signatures,
+    };
+  } finally {
+    context.activeLibraryLoads.delete(moduleName);
+    context.scope = previousScope;
+    context.source = previousSource;
+    context.warnings.splice(previousWarningCount);
+  }
+}
+
+function findLibraryModule(
+  scope: Scope,
+  parts: string[],
+): Extract<HarlanValue, { kind: "record" }> | null {
+  let current = scope.get(parts[0]!);
+  for (const part of parts.slice(1)) {
+    if (!current || current.kind !== "record") {
+      return null;
+    }
+    current = current.fields.get(part);
+  }
+
+  if (current?.kind === "record" && current.libraryModuleName === parts.join(".")) {
+    return current;
+  }
+
+  return null;
+}
+
+function assertLibraryNamespaceAvailable(
+  scope: Scope,
+  parts: string[],
+  context: RuntimeContext,
+  span: SourceSpan,
+): void {
+  const root = scope.get(parts[0]!);
+  if (!root) {
+    return;
+  }
+
+  if (root.kind !== "record" || (!root.namespaceName && !root.libraryModuleName)) {
+    throw new RuntimeError(
+      `cannot import library \`${parts.join(".")}\`: binding \`${parts[0]!}\` already exists and is immutable`,
+      span,
+      context.source,
+    );
+  }
+
+  if (root.libraryModuleName) {
+    throw new RuntimeError(
+      `cannot import library \`${parts.join(".")}\`: module \`${root.libraryModuleName}\` cannot be used as a namespace`,
+      span,
+      context.source,
+    );
+  }
+
+  let current = root;
+  for (let index = 1; index < parts.length - 1; index += 1) {
+    const namespaceName = parts.slice(0, index + 1).join(".");
+    const child = current.fields.get(parts[index]!);
+    if (!child) {
+      return;
+    }
+
+    if (child.kind !== "record" || (!child.namespaceName && !child.libraryModuleName)) {
+      throw new RuntimeError(
+        `cannot import library \`${parts.join(".")}\`: namespace \`${namespaceName}\` collides with an immutable binding`,
+        span,
+        context.source,
+      );
+    }
+
+    if (child.libraryModuleName) {
+      throw new RuntimeError(
+        `cannot import library \`${parts.join(".")}\`: module \`${child.libraryModuleName}\` cannot be used as a namespace`,
+        span,
+        context.source,
+      );
+    }
+
+    current = child;
+  }
+}
+
+function bindLibraryModule(
+  scope: Scope,
+  parts: string[],
+  moduleRecord: HarlanValue,
+  context: RuntimeContext,
+  span: SourceSpan,
+): void {
+  const rootName = parts[0]!;
+  let root = scope.get(rootName);
+
+  if (!root) {
+    root = { kind: "record", fields: new Map(), namespaceName: rootName };
+    scope.set(rootName, root);
+  } else if (root.kind !== "record" || (!root.namespaceName && !root.libraryModuleName)) {
+    throw new RuntimeError(
+      `cannot import library \`${parts.join(".")}\`: binding \`${rootName}\` already exists and is immutable`,
+      span,
+      context.source,
+    );
+  }
+
+  let current = root;
+  for (const part of parts.slice(1, -1)) {
+    const child = current.fields.get(part);
+    if (!child) {
+      const namespace: HarlanValue = {
+        kind: "record",
+        fields: new Map(),
+        namespaceName: parts.slice(0, parts.indexOf(part) + 1).join("."),
+      };
+      current.fields.set(part, namespace);
+      current = namespace;
+      continue;
+    }
+
+    if (child.kind !== "record" || (!child.namespaceName && !child.libraryModuleName)) {
+      throw new RuntimeError(
+        `cannot import library \`${parts.join(".")}\`: namespace \`${part}\` collides with an immutable binding`,
+        span,
+        context.source,
+      );
+    }
+
+    if (child.libraryModuleName) {
+      throw new RuntimeError(
+        `cannot import library \`${parts.join(".")}\`: module \`${child.libraryModuleName}\` cannot be used as a namespace`,
+        span,
+        context.source,
+      );
+    }
+
+    current = child;
+  }
+
+  const leaf = parts.at(-1)!;
+  const existing = current.fields.get(leaf);
+  if (existing) {
+    if (existing.kind === "record" && existing.libraryModuleName === parts.join(".")) {
+      return;
+    }
+    throw new RuntimeError(
+      `cannot import library \`${parts.join(".")}\`: namespace leaf \`${leaf}\` already exists`,
+      span,
+      context.source,
+    );
+  }
+  current.fields.set(leaf, moduleRecord);
+}
+
+function renderLibraryImportDisclosure(moduleName: string, signatures: string[]): string {
+  if (signatures.length === 0) {
+    return `Imported ${moduleName}: no exported functions`;
+  }
+
+  return [`Imported ${moduleName}:`, ...signatures.map((signature) => `- ${signature}`)].join("\n");
+}
+
+function renderLibraryRevealDisclosure(
+  library: NonNullable<Extract<HarlanValue, { kind: "function" }>["library"]>,
+): string {
+  return [`Revealed ${library.moduleName}:`, `- ${library.signature}`, "", library.source].join(
+    "\n",
+  );
 }
 
 function createUserFunction(declaration: FunctionDeclaration, parentScope: Scope): HarlanValue {
@@ -293,12 +639,27 @@ function serializeHarlanValue(value: HarlanValue, initialScope: Scope): Serializ
         items: value.items.map((item) => serializeHarlanValue(item, initialScope)),
       };
     case "record":
+      if (value.libraryModuleName) {
+        return {
+          kind: "libraryModule",
+          name: value.libraryModuleName,
+          signatures: value.signatures ?? [],
+          fields: Object.fromEntries(
+            [...value.fields.entries()].map(([name, fieldValue]) => [
+              name,
+              serializeHarlanValue(fieldValue, initialScope),
+            ]),
+          ),
+        };
+      }
+
       if (value.moduleName) {
         return { kind: "module", name: value.moduleName };
       }
 
       return {
         kind: "record",
+        namespaceName: value.namespaceName,
         fields: Object.fromEntries(
           [...value.fields.entries()].map(([name, fieldValue]) => [
             name,
@@ -312,6 +673,24 @@ function serializeHarlanValue(value: HarlanValue, initialScope: Scope): Serializ
       }
 
       if (value.declaration && value.closure) {
+        if (value.library) {
+          return {
+            kind: "libraryFunction",
+            moduleName: value.library.moduleName,
+            functionName: value.library.functionName,
+            signature: value.library.signature,
+            source: value.library.source,
+            moduleSource: value.library.moduleSource,
+            declaration: value.declaration,
+            closure: Object.fromEntries(
+              [...value.closure.entries()].map(([name, closureValue]) => [
+                name,
+                serializeHarlanValue(closureValue, initialScope),
+              ]),
+            ),
+          };
+        }
+
         return {
           kind: "function",
           name: value.name ?? value.declaration.name,
@@ -351,6 +730,19 @@ function deserializeHarlanValue(
     case "record":
       return {
         kind: "record",
+        namespaceName: "namespaceName" in value ? value.namespaceName : undefined,
+        fields: new Map(
+          Object.entries(value.fields).map(([name, fieldValue]) => [
+            name,
+            deserializeHarlanValue(fieldValue, initialScope, stdlib),
+          ]),
+        ),
+      };
+    case "libraryModule":
+      return {
+        kind: "record",
+        libraryModuleName: value.name,
+        signatures: value.signatures,
         fields: new Map(
           Object.entries(value.fields).map(([name, fieldValue]) => [
             name,
@@ -381,6 +773,26 @@ function deserializeHarlanValue(
       );
       return createUserFunctionFromClosure(value.declaration, closure, value.name);
     }
+    case "libraryFunction": {
+      const closure = new Map(
+        Object.entries(value.closure).map(([name, closureValue]) => [
+          name,
+          deserializeHarlanValue(closureValue, initialScope, stdlib),
+        ]),
+      );
+      return createUserFunctionFromClosure(
+        value.declaration,
+        closure,
+        `${value.moduleName}.${value.signature}`,
+        {
+          moduleName: value.moduleName,
+          functionName: value.functionName,
+          signature: value.signature,
+          source: value.source,
+          moduleSource: value.moduleSource,
+        },
+      );
+    }
   }
 }
 
@@ -389,8 +801,8 @@ function findStdlibFunction(
   initialScope: Scope,
   stdlib: Map<string, HarlanModule>,
 ): HarlanValue | null {
-  if (name === "import") {
-    return initialScope.get("import") ?? null;
+  if (name === "import" || name === "revealImpl") {
+    return initialScope.get(name) ?? null;
   }
 
   const [moduleName, bindingName] = name.split(".");
@@ -405,12 +817,14 @@ function createUserFunctionFromClosure(
   declaration: FunctionDeclaration,
   frozenScope: Scope,
   name: string,
+  library?: Extract<HarlanValue, { kind: "function" }>["library"],
 ): HarlanValue {
   return {
     kind: "function",
     name,
     declaration,
     closure: frozenScope,
+    library,
     call: async (args, context, span) => {
       if (args.length !== declaration.params.length) {
         throw new RuntimeError(
@@ -425,7 +839,17 @@ function createUserFunctionFromClosure(
         localScope.set(param.name, args[index]!);
       });
 
-      return evaluateExpression(declaration.body, localScope, context);
+      if (!library) {
+        return evaluateExpression(declaration.body, localScope, context);
+      }
+
+      const previousSource = context.source;
+      try {
+        context.source = library.moduleSource;
+        return await evaluateExpression(declaration.body, localScope, context);
+      } finally {
+        context.source = previousSource;
+      }
     },
   };
 }
@@ -433,8 +857,8 @@ function createUserFunctionFromClosure(
 function collectImportedModules(value: HarlanValue, importedModules: Set<string>): void {
   switch (value.kind) {
     case "record":
-      if (value.moduleName) {
-        importedModules.add(value.moduleName);
+      if (value.moduleName || value.libraryModuleName) {
+        importedModules.add(value.moduleName ?? value.libraryModuleName!);
         return;
       }
       for (const fieldValue of value.fields.values()) {
@@ -537,9 +961,11 @@ function attachRunState(
 function summarizeSerializedKind(value: SerializedHarlanValue): HarlanBindingSummary["kind"] {
   switch (value.kind) {
     case "module":
+    case "libraryModule":
       return "module";
     case "stdlibFunction":
     case "function":
+    case "libraryFunction":
       return "function";
     default:
       return value.kind;

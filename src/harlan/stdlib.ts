@@ -39,6 +39,8 @@ export type HarlanRunOptions = {
   maxOutputChars?: number;
   sessionSnapshot?: HarlanSessionSnapshot;
   maxSessionStateChars?: number;
+  libraryRoot?: string;
+  enableUserLibraries?: boolean;
 };
 
 export type SerializedHarlanValue =
@@ -47,9 +49,25 @@ export type SerializedHarlanValue =
   | { kind: "number"; value: number }
   | { kind: "boolean"; value: boolean }
   | { kind: "list"; items: SerializedHarlanValue[] }
-  | { kind: "record"; fields: Record<string, SerializedHarlanValue> }
+  | { kind: "record"; fields: Record<string, SerializedHarlanValue>; namespaceName?: string }
   | { kind: "module"; name: string }
+  | {
+      kind: "libraryModule";
+      name: string;
+      fields: Record<string, SerializedHarlanValue>;
+      signatures: string[];
+    }
   | { kind: "stdlibFunction"; name: string }
+  | {
+      kind: "libraryFunction";
+      moduleName: string;
+      functionName: string;
+      signature: string;
+      source: string;
+      moduleSource: string;
+      declaration: FunctionDeclaration;
+      closure: Record<string, SerializedHarlanValue>;
+    }
   | {
       kind: "function";
       name: string;
@@ -60,6 +78,7 @@ export type SerializedHarlanValue =
 export type HarlanSessionSnapshot = {
   bindings: Record<string, SerializedHarlanValue>;
   importedModules: string[];
+  initialized?: boolean;
 };
 
 export type HarlanBindingSummary = {

@@ -13,10 +13,22 @@ export function renderHarlanValue(value: HarlanValue): string {
     case "list":
       return `[${value.items.map(renderHarlanValueForCollection).join(", ")}]`;
     case "record":
+      if (value.libraryModuleName) {
+        const signatures = value.signatures ?? [];
+        if (signatures.length === 0) {
+          return `<module ${value.libraryModuleName}: no exported functions>`;
+        }
+        return [`<module ${value.libraryModuleName}>`, ...signatures.map((sig) => `- ${sig}`)].join(
+          "\n",
+        );
+      }
       return `{ ${[...value.fields.entries()]
         .map(([key, fieldValue]) => `${key}: ${renderHarlanValueForCollection(fieldValue)}`)
         .join(", ")} }`;
     case "function":
+      if (value.library) {
+        return `<function ${value.library.moduleName}.${value.library.signature}>`;
+      }
       return `<function${value.name ? ` ${value.name}` : ""}>`;
   }
 }
@@ -28,7 +40,9 @@ export function renderHarlanResult(
   const maxChars = options.maxChars ?? 20_000;
   const warnings = result.warnings.length > 0 ? `${result.warnings.join("\n")}\n` : "";
   const output = result.output.length > 0 ? `${result.output.join("\n")}\n` : "";
-  return truncateRendered(`${warnings}${output}${renderHarlanValue(result.value)}`, maxChars);
+  const renderedValue =
+    result.suppressNullValue && result.value.kind === "null" ? "" : renderHarlanValue(result.value);
+  return truncateRendered(`${warnings}${output}${renderedValue}`, maxChars);
 }
 
 export function harlanValueToJson(value: HarlanValue): unknown {
@@ -42,6 +56,9 @@ export function harlanValueToJson(value: HarlanValue): unknown {
     case "list":
       return value.items.map(harlanValueToJson);
     case "record":
+      if (value.libraryModuleName) {
+        return `<module ${value.libraryModuleName}>`;
+      }
       return Object.fromEntries(
         [...value.fields.entries()].map(([key, fieldValue]) => [
           key,
@@ -49,6 +66,9 @@ export function harlanValueToJson(value: HarlanValue): unknown {
         ]),
       );
     case "function":
+      if (value.library) {
+        return `<function ${value.library.moduleName}.${value.library.signature}>`;
+      }
       return `<function${value.name ? ` ${value.name}` : ""}>`;
   }
 }

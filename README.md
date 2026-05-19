@@ -60,6 +60,16 @@ fs.read("README.md")
   |> text.take(3)
 ```
 
+Workspace-local user libraries live under `harlan/` and are imported with dot specifiers:
+
+```harlan
+import("mymodule.hello")
+
+mymodule.hello.greet("Ada")
+```
+
+`import("mymodule.hello")` maps to `harlan/mymodule/hello.harlan` under the runtime working directory. User library imports are side-effecting: they create or extend the persistent namespace tree, so they do not need to be assigned to a `let` binding.
+
 The pipeline operator passes the value on the left as the first argument to the function call on the right:
 
 ```harlan
@@ -198,6 +208,64 @@ shell.run("printf hello")
 | `text`   | `lines`, `join`, `take`, `contains`, `trim`, `lower`, `includes` |
 | `format` | `json`, `lines`, `table`                                         |
 | `shell`  | `run`                                                            |
+
+## User Libraries
+
+A user library file may contain private top-level `let` bindings, imports, top-level `fn` declarations, and an optional final expression. Only top-level functions are exported.
+
+```harlan
+// harlan/mymodule/hello.harlan
+let text = import("text")
+
+fn greet(name: String) -> String =
+  text.trim(name)
+```
+
+Import it once in a session:
+
+```harlan
+import("mymodule.hello")
+```
+
+Then call exported functions through the namespace:
+
+```harlan
+mymodule.hello.greet("  Ada  ")
+```
+
+Import results render signatures, not implementation bodies:
+
+```text
+Imported mymodule.hello:
+- greet(name: String) -> String
+```
+
+Function values also render without bodies:
+
+```text
+<function mymodule.hello.greet(name: String) -> String>
+```
+
+Use `revealImpl` only when the function body is needed:
+
+```harlan
+revealImpl(mymodule.hello.greet)
+```
+
+`revealImpl` accepts a user-library function value and reveals the source for that function declaration in the tool result, similar to import disclosures. It returns `null`, so it cannot be used to capture source as a string. It does not reveal private top-level `let` bindings or unrelated functions, rejects stdlib or normal session-defined functions, and is intended for agent code or `harlan/init.harlan`, not user libraries.
+
+Slash paths are not valid user-library imports. Use `import("mymodule.hello")`, not `import("mymodule/hello")`.
+
+## Session Init
+
+Persistent agent sessions run `harlan/init.harlan` once before the first session Harlan execution, if the file exists. It is useful for preloading library namespaces:
+
+```harlan
+import("mymodule.hello")
+import("repo.search")
+```
+
+Successful init state is saved into the session snapshot before the requested code runs. If init fails, Harlan returns a warning with the init error and continues running the requested code with the pre-init snapshot.
 
 ## Agent Workflow Examples
 

@@ -44,6 +44,7 @@ const runRecordSchema = z.object({
 const harlanSessionSnapshotSchema = z.object({
   bindings: z.record(z.string(), z.custom<SerializedHarlanValue>()),
   importedModules: z.array(z.string()),
+  initialized: z.boolean().optional(),
 });
 
 const persistedStateSchema = z.object({
